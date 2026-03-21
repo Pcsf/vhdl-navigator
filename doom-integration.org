@@ -1,0 +1,69 @@
+* VHDL Navigator — config.org integration
+
+Add the following blocks to your =config.org=.
+
+** packages.el — declare the package
+
+#+begin_src emacs-lisp :tangle packages.el
+;; vhdl-navigator: local package for VHDL record completion & go-to-definition
+;; Adjust the :local-repo path to wherever you place vhdl-navigator.el
+(package! vhdl-navigator
+  :recipe (:local-repo "~/.config/doom/lisp/vhdl-navigator"
+           :files ("*.el")))
+#+end_src
+
+** config.el — configure the package
+
+#+begin_src emacs-lisp :tangle config.el
+(use-package! vhdl-navigator
+  :after vhdl-mode
+  :hook (vhdl-mode . vhdl-navigator-mode)
+  :config
+  ;; Customize to match your project layout
+  (setq vhdl-nav-file-extensions '("vhd" "vhdl")
+        vhdl-nav-auto-reindex-on-save t
+        vhdl-nav-completion-annotation t)
+
+  ;; Evil keybindings (leader-prefixed)
+  (map! :map vhdl-navigator-mode-map
+        :localleader
+        "r" #'vhdl-nav-show-record          ; SPC m r → show record fields
+        "l" #'vhdl-nav-list-definitions     ; SPC m l → list all definitions
+        "j" #'vhdl-nav-jump-to-record-field ; SPC m j → pick record → field → jump
+        "i" #'vhdl-nav-reindex))            ; SPC m i → force full reindex
+#+end_src
+
+** Installation steps
+
+1. Create the directory:
+   #+begin_src bash
+   mkdir -p ~/.config/doom/lisp/vhdl-navigator
+   #+end_src
+
+2. Copy =vhdl-navigator.el= into that directory.
+
+3. Tangle your =config.org= (or add the blocks above and =C-c C-v t=).
+
+4. Run:
+   #+begin_src bash
+   doom sync
+   #+end_src
+
+5. Kill and restart the daemon:
+   #+begin_src bash
+   emacsclient -e "(kill-emacs)"
+   emacs --daemon
+   #+end_src
+
+** Usage cheat sheet
+
+| Action                          | Keys (Evil normal) | Notes                                 |
+|---------------------------------+--------------------+---------------------------------------|
+| Go to definition                | =gd=               | xref — works on any indexed symbol    |
+| Go back                         | =C-o= or =C-t=    | xref pop                              |
+| Record field completion         | Type =r.= then TAB | capf — Corfu/Vertico auto-completes   |
+| Show record fields (help buf)   | =SPC m r=          | Interactive record picker             |
+| Jump to record field            | =SPC m j=          | Pick record → pick field → jump       |
+| List all definitions            | =SPC m l=          | Searchable buffer of all indexed defs |
+| Force re-index                  | =SPC m i=          | Usually not needed (auto on save)     |
+| Eldoc (minibuffer)              | Automatic          | Shows field type when cursor after =.= |
