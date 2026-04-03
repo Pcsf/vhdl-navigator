@@ -37,7 +37,7 @@ emacs --batch -f batch-byte-compile vhdl-navigator.el
 
 The package is structured as a single file with these logical sections:
 
-1. **Customization** — `defcustom` vars: `vhdl-nav-file-extensions`, `vhdl-nav-auto-reindex-on-save`, `vhdl-nav-completion-annotation`, `vhdl-nav-debug`.
+1. **Customization** — `defcustom` vars: `vhdl-nav-file-extensions`, `vhdl-nav-auto-reindex-on-save`, `vhdl-nav-completion-annotation`, `vhdl-nav-debug`, `vhdl-nav-index-batch-size`.
 
 2. **Data structure** — `vhdl-nav-def` (cl-defstruct) holds: `name`, `kind` (one of `record field entity architecture signal constant variable function procedure package type`), `type-name`, `parent`, `file`, `line`, `fields` (for records: list of `(field-name . type-string)`).
 
@@ -50,6 +50,7 @@ The package is structured as a single file with these logical sections:
    - `vhdl-nav--file-mtimes`: root → (file → mtime) hash-table
    - Index stores *lists* of defs per name to handle duplicates across files.
    - Incremental reindex (`vhdl-nav--reindex-file`) removes all defs from a file then re-adds them.
+   - **Async indexing** (`vhdl-nav--build-index-async`): on first activation, files are parsed in batches of `vhdl-nav-index-batch-size` per idle timer tick (0.1s interval). This keeps the UI responsive for large projects. Features work with the partial index as it builds. A synchronous fallback (`vhdl-nav--build-index-sync`) is used for forced reindex or when batch size is 0.
 
 6. **Dot-chain resolver** — walks backward over `a.b.c.` from cursor, resolves each segment's type through the index via `vhdl-nav--resolve-type` → `vhdl-nav--strip-type-qualifiers` → `vhdl-nav--find-record`, then returns the final record's fields as capf candidates.
 
