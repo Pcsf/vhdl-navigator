@@ -1061,7 +1061,8 @@ Otherwise processes one batch and schedules the next."
                   #'vhdl-nav-eldoc-function nil t)
         (add-hook 'after-save-hook
                   #'vhdl-nav--after-save-hook nil t)
-        (vhdl-nav--get-index))
+        ;; Defer index loading to idle time so the buffer opens instantly
+        (run-with-idle-timer 0.3 nil #'vhdl-nav--get-index))
     (remove-hook 'completion-at-point-functions
                  #'vhdl-nav-completion-at-point t)
     (remove-hook 'xref-backend-functions
