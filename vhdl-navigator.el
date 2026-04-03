@@ -64,6 +64,14 @@ Set to 0 to use synchronous (blocking) indexing."
   :type 'integer
   :group 'vhdl-navigator)
 
+(defcustom vhdl-nav-cache-directory
+  (expand-file-name "vhdl-navigator/" user-emacs-directory)
+  "Directory for persistent index cache files.
+Each project gets its own cache file (named by MD5 of root path).
+Set to nil to disable persistent caching."
+  :type '(choice directory (const nil))
+  :group 'vhdl-navigator)
+
 ;; ---------------------------------------------------------------------------
 ;; Internal data structures
 ;; ---------------------------------------------------------------------------
@@ -410,26 +418,179 @@ Never signals -- returns nil on any fatal error."
      nil)))
 
 ;; ---------------------------------------------------------------------------
+;; Persistent cache
+;; ---------------------------------------------------------------------------
+
+(defun vhdl-nav--cache-file (root)
+  "Return the cache file path for project ROOT."
+  (when vhdl-nav-cache-directory
+    (expand-file-name (concat (md5 root) ".el")
+                      vhdl-nav-cache-directory)))
+
+(defun vhdl-nav--save-cache (root)
+  "Save the index and mtimes for ROOT to disk."
+  (condition-case err
+      (let ((cache-file (vhdl-nav--cache-file root)))
+        (when cache-file
+          (let ((index (gethash root vhdl-nav--project-indices))
+                (mtimes (gethash root vhdl-nav--file-mtimes)))
+            (when (and index mtimes)
+              (unless (file-directory-p vhdl-nav-cache-directory)
+                (make-directory vhdl-nav-cache-directory t))
+              ;; Convert index hash → alist of (name . list-of-defs)
+              (let ((index-alist '())
+                    (mtimes-alist '()))
+                (maphash (lambda (k v) (push (cons k v) index-alist)) index)
+                (maphash (lambda (k v) (push (cons k v) mtimes-alist)) mtimes)
+                (with-temp-file cache-file
+                  (let ((print-level nil)
+                        (print-length nil))
+                    (prin1 (list :version 1
+                                 :root root
+                                 :mtimes mtimes-alist
+                                 :index index-alist)
+                           (current-buffer))))
+                (when vhdl-nav-debug
+                  (message "vhdl-navigator: cache saved to %s" cache-file)))))))
+    (error
+     (message "vhdl-navigator: failed to save cache: %s" err))))
+
+(defun vhdl-nav--load-cache (root)
+  "Load cached index and mtimes for ROOT from disk.
+Returns (index-hash . mtimes-hash) or nil if no valid cache."
+  (condition-case err
+      (let ((cache-file (vhdl-nav--cache-file root)))
+        (when (and cache-file (file-exists-p cache-file))
+          (let* ((data (with-temp-buffer
+                         (insert-file-contents cache-file)
+                         (read (current-buffer))))
+                 (version (plist-get data :version))
+                 (cached-root (plist-get data :root)))
+            (when (and (eq version 1)
+                       (equal cached-root root))
+              (let ((index (make-hash-table :test 'equal))
+                    (mtimes (make-hash-table :test 'equal))
+                    (index-alist (plist-get data :index))
+                    (mtimes-alist (plist-get data :mtimes)))
+                (dolist (entry mtimes-alist)
+                  (puthash (car entry) (cdr entry) mtimes))
+                (dolist (entry index-alist)
+                  (let ((name (car entry))
+                        (defs (cdr entry)))
+                    ;; Validate that all defs are proper structs
+                    (when (cl-every #'vhdl-nav-def-p defs)
+                      (puthash name defs index))))
+                (when vhdl-nav-debug
+                  (message "vhdl-navigator: cache loaded from %s" cache-file))
+                (cons index mtimes))))))
+    (error
+     (message "vhdl-navigator: failed to load cache: %s" err)
+     nil)))
+
+(defun vhdl-nav--diff-files (root cached-mtimes)
+  "Compare files on disk with CACHED-MTIMES for project ROOT.
+Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
+  (let ((disk-files (vhdl-nav--find-vhdl-files root))
+        (stale '())
+        (seen (make-hash-table :test 'equal)))
+    ;; Find new or modified files
+    (dolist (f disk-files)
+      (puthash f t seen)
+      (let ((cached-mtime (gethash f cached-mtimes))
+            (current-mtime (ignore-errors
+                             (file-attribute-modification-time
+                              (file-attributes f)))))
+        (when (or (null cached-mtime)
+                  (not (equal cached-mtime current-mtime)))
+          (push f stale))))
+    ;; Find deleted files (in cache but not on disk)
+    (let ((deleted '()))
+      (maphash (lambda (f _mtime)
+                 (unless (gethash f seen)
+                   (push f deleted)))
+               cached-mtimes)
+      (list :stale stale :deleted deleted))))
+
+;; ---------------------------------------------------------------------------
 ;; Index management
 ;; ---------------------------------------------------------------------------
 
 (defun vhdl-nav--get-index (&optional force)
   "Get or build the VHDL index for the current project.
-When FORCE is non-nil, rebuild synchronously."
+When FORCE is non-nil, rebuild from scratch (ignoring cache)."
   (let* ((root (vhdl-nav--project-root))
          (index (gethash root vhdl-nav--project-indices)))
     (when (or force (not index))
       (if force
-          ;; Forced: synchronous full rebuild
+          ;; Forced: synchronous full rebuild, then save cache
           (progn
             (vhdl-nav--async-cancel)
             (setq index (vhdl-nav--build-index-sync root))
-            (puthash root index vhdl-nav--project-indices))
-        ;; First access: create empty index and start async build
-        (setq index (make-hash-table :test 'equal))
-        (puthash root index vhdl-nav--project-indices)
-        (vhdl-nav--build-index-async root)))
+            (puthash root index vhdl-nav--project-indices)
+            (vhdl-nav--save-cache root))
+        ;; First access: try loading cache, then update incrementally
+        (let ((cached (vhdl-nav--load-cache root)))
+          (if cached
+              (let* ((cached-index (car cached))
+                     (cached-mtimes (cdr cached))
+                     (diff (vhdl-nav--diff-files root cached-mtimes)))
+                ;; Install cached data
+                (puthash root cached-index vhdl-nav--project-indices)
+                (puthash root cached-mtimes vhdl-nav--file-mtimes)
+                (setq index cached-index)
+                ;; Remove defs from deleted files
+                (dolist (del (plist-get diff :deleted))
+                  (vhdl-nav--purge-file-from-index cached-index del)
+                  (remhash del cached-mtimes))
+                ;; Queue only stale (new/modified) files for re-parsing
+                (let ((stale (plist-get diff :stale)))
+                  (if stale
+                      (progn
+                        (message "vhdl-navigator: cache loaded, %d file(s) to update"
+                                 (length stale))
+                        (vhdl-nav--build-index-async-files root stale))
+                    (message "vhdl-navigator: cache loaded, index is up to date"))))
+            ;; No cache: empty index + full async build
+            (setq index (make-hash-table :test 'equal))
+            (puthash root index vhdl-nav--project-indices)
+            (vhdl-nav--build-index-async root)))))
     index))
+
+(defun vhdl-nav--purge-file-from-index (index filepath)
+  "Remove all defs belonging to FILEPATH from INDEX hash-table."
+  (maphash (lambda (key defs)
+             (let ((filtered (seq-remove
+                              (lambda (d)
+                                (and (vhdl-nav-def-p d)
+                                     (string= (vhdl-nav-def-file d) filepath)))
+                              defs)))
+               (if filtered
+                   (puthash key filtered index)
+                 (remhash key index))))
+           index))
+
+(defun vhdl-nav--index-file-into (index mtimes filepath)
+  "Parse FILEPATH and merge its defs into INDEX, updating MTIMES.
+Returns the number of defs added."
+  (condition-case err
+      (let ((defs (vhdl-nav--parse-file filepath))
+            (count 0))
+        (when (listp defs)
+          (ignore-errors
+            (puthash filepath (file-attribute-modification-time
+                               (file-attributes filepath))
+                     mtimes))
+          (dolist (d defs)
+            (when (and (vhdl-nav-def-p d)
+                       (stringp (vhdl-nav-def-name d)))
+              (let* ((name (vhdl-nav-def-name d))
+                     (existing (gethash name index)))
+                (puthash name (cons d existing) index))
+              (setq count (1+ count)))))
+        count)
+    (error
+     (message "vhdl-navigator: error on %s: %s" filepath err)
+     0)))
 
 (defun vhdl-nav--build-index-sync (root)
   "Build a fresh index for project at ROOT synchronously."
@@ -439,21 +600,7 @@ When FORCE is non-nil, rebuild synchronously."
         (mtimes (make-hash-table :test 'equal))
         (count 0))
     (dolist (f (or files '()))
-      (condition-case err
-          (let ((defs (vhdl-nav--parse-file f)))
-            (when (listp defs)
-              (ignore-errors
-                (puthash f (file-attribute-modification-time
-                            (file-attributes f))
-                         mtimes))
-              (dolist (d defs)
-                (when (and (vhdl-nav-def-p d)
-                           (stringp (vhdl-nav-def-name d)))
-                  (let* ((name (vhdl-nav-def-name d))
-                         (existing (gethash name index)))
-                    (puthash name (cons d existing) index))))
-              (setq count (+ count (length defs)))))
-        (error (message "vhdl-navigator: error on %s: %s" f err))))
+      (setq count (+ count (vhdl-nav--index-file-into index mtimes f))))
     (puthash root mtimes vhdl-nav--file-mtimes)
     (message "vhdl-navigator: indexed %d definitions from %d files"
              count (length (or files '())))
@@ -467,34 +614,52 @@ When FORCE is non-nil, rebuild synchronously."
           vhdl-nav--async-queue nil)))
 
 (defun vhdl-nav--build-index-async (root)
-  "Start async indexing for project at ROOT.
-Parses `vhdl-nav-index-batch-size' files per idle cycle."
-  (vhdl-nav--async-cancel)
+  "Start full async indexing for project at ROOT."
   (let ((files (vhdl-nav--find-vhdl-files root)))
-    (if (or (null files) (<= vhdl-nav-index-batch-size 0))
-        ;; No files or sync mode requested: fall back to sync
-        (let ((index (vhdl-nav--build-index-sync root)))
-          (puthash root index vhdl-nav--project-indices))
-      ;; Ensure mtimes table exists
-      (unless (gethash root vhdl-nav--file-mtimes)
-        (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
-      (setq vhdl-nav--async-root root
-            vhdl-nav--async-queue files
-            vhdl-nav--async-total (length files)
-            vhdl-nav--async-count 0)
-      (message "vhdl-navigator: async indexing %d files in %s..."
-               vhdl-nav--async-total (abbreviate-file-name root))
-      (setq vhdl-nav--async-timer
-            (run-with-idle-timer 0.1 t #'vhdl-nav--async-index-batch)))))
+    (vhdl-nav--build-index-async-files root files)))
+
+(defun vhdl-nav--build-index-async-files (root files)
+  "Start async indexing of FILES for project at ROOT.
+Parses `vhdl-nav-index-batch-size' files per idle cycle.
+Stale files are purged from the index before re-parsing."
+  (vhdl-nav--async-cancel)
+  (if (or (null files) (<= vhdl-nav-index-batch-size 0))
+      ;; No files or sync mode: fall back to sync for just these files
+      (when files
+        (let ((index (or (gethash root vhdl-nav--project-indices)
+                         (make-hash-table :test 'equal)))
+              (mtimes (or (gethash root vhdl-nav--file-mtimes)
+                          (make-hash-table :test 'equal)))
+              (count 0))
+          (dolist (f files)
+            (vhdl-nav--purge-file-from-index index f)
+            (setq count (+ count (vhdl-nav--index-file-into index mtimes f))))
+          (puthash root index vhdl-nav--project-indices)
+          (puthash root mtimes vhdl-nav--file-mtimes)
+          (message "vhdl-navigator: updated %d definitions from %d files"
+                   count (length files))
+          (vhdl-nav--save-cache root)))
+    ;; Ensure mtimes table exists
+    (unless (gethash root vhdl-nav--file-mtimes)
+      (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
+    (setq vhdl-nav--async-root root
+          vhdl-nav--async-queue files
+          vhdl-nav--async-total (length files)
+          vhdl-nav--async-count 0)
+    (message "vhdl-navigator: async indexing %d file(s) in %s..."
+             vhdl-nav--async-total (abbreviate-file-name root))
+    (setq vhdl-nav--async-timer
+          (run-with-idle-timer 0.1 t #'vhdl-nav--async-index-batch))))
 
 (defun vhdl-nav--async-index-batch ()
   "Parse one batch of files from the async queue."
   (if (null vhdl-nav--async-queue)
-      ;; Done
-      (progn
+      ;; Done — save cache and clean up
+      (let ((root vhdl-nav--async-root))
         (vhdl-nav--async-cancel)
-        (message "vhdl-navigator: async indexing complete — %d definitions from %d files"
-                 vhdl-nav--async-count vhdl-nav--async-total))
+        (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
+                 vhdl-nav--async-count vhdl-nav--async-total)
+        (vhdl-nav--save-cache root))
     ;; Parse a batch
     (let* ((root vhdl-nav--async-root)
            (index (gethash root vhdl-nav--project-indices))
@@ -503,22 +668,11 @@ Parses `vhdl-nav-index-batch-size' files per idle cycle."
            (processed 0))
       (while (and vhdl-nav--async-queue (< processed batch-size))
         (let ((f (pop vhdl-nav--async-queue)))
-          (condition-case err
-              (let ((defs (vhdl-nav--parse-file f)))
-                (when (listp defs)
-                  (ignore-errors
-                    (puthash f (file-attribute-modification-time
-                                (file-attributes f))
-                             mtimes))
-                  (dolist (d defs)
-                    (when (and (vhdl-nav-def-p d)
-                               (stringp (vhdl-nav-def-name d)))
-                      (let* ((name (vhdl-nav-def-name d))
-                             (existing (gethash name index)))
-                        (puthash name (cons d existing) index))))
-                  (setq vhdl-nav--async-count
-                        (+ vhdl-nav--async-count (length defs)))))
-            (error (message "vhdl-navigator: error on %s: %s" f err))))
+          ;; Purge old defs for this file before re-parsing
+          (vhdl-nav--purge-file-from-index index f)
+          (setq vhdl-nav--async-count
+                (+ vhdl-nav--async-count
+                   (vhdl-nav--index-file-into index mtimes f))))
         (setq processed (1+ processed)))
       ;; Progress message
       (let ((remaining (length vhdl-nav--async-queue)))
@@ -529,23 +683,15 @@ Parses `vhdl-nav-index-batch-size' files per idle cycle."
 (defun vhdl-nav--reindex-file (filepath)
   "Re-index a single FILEPATH and merge into the project index."
   (let* ((root (vhdl-nav--project-root))
-         (index (gethash root vhdl-nav--project-indices)))
+         (index (gethash root vhdl-nav--project-indices))
+         (mtimes (or (gethash root vhdl-nav--file-mtimes)
+                     (let ((ht (make-hash-table :test 'equal)))
+                       (puthash root ht vhdl-nav--file-mtimes)
+                       ht))))
     (when index
-      (maphash (lambda (key defs)
-                 (puthash key
-                          (seq-remove (lambda (d)
-                                        (and (vhdl-nav-def-p d)
-                                             (string= (vhdl-nav-def-file d) filepath)))
-                                      defs)
-                          index))
-               index)
-      (let ((defs (vhdl-nav--parse-file filepath)))
-        (when (listp defs)
-          (dolist (d defs)
-            (when (and (vhdl-nav-def-p d) (stringp (vhdl-nav-def-name d)))
-              (let* ((name (vhdl-nav-def-name d))
-                     (existing (gethash name index)))
-                (puthash name (cons d existing) index)))))))))
+      (vhdl-nav--purge-file-from-index index filepath)
+      (vhdl-nav--index-file-into index mtimes filepath)
+      (vhdl-nav--save-cache root))))
 
 (defun vhdl-nav--after-save-hook ()
   "Re-index the current file on save."

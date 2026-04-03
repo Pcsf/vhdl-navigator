@@ -52,12 +52,20 @@ Then `doom sync` and restart the daemon.
 
 ## How It Works
 
-On first activation, the package discovers all `.vhd` / `.vhdl` files under the
-project root and indexes them **asynchronously** in the background using idle
-timers. Files are parsed in small batches (default 20 per idle cycle), so Emacs
-stays responsive even for large projects with hundreds of files. Features
-(completion, xref, eldoc) work immediately with whatever has been indexed so far.
-On each file save, only that file is re-parsed (incremental).
+On first activation, the package checks for a **persistent cache** on disk. If a
+valid cache exists, it loads instantly and only re-parses files whose modification
+time has changed since the last session. New and modified files are indexed
+**asynchronously** in the background using idle timers (default 20 files per idle
+cycle), so Emacs stays responsive even for large projects. Deleted files are
+automatically pruned from the index.
+
+If no cache exists (first run), all files are indexed asynchronously from scratch.
+Features (completion, xref, eldoc) work immediately with whatever has been indexed
+so far. On each file save, only that file is re-parsed and the cache is updated.
+
+The cache is stored under `~/.emacs.d/vhdl-navigator/` (one file per project,
+named by MD5 of the project root). Set `vhdl-nav-cache-directory` to nil to
+disable persistence.
 
 The index maps symbol names to location + type metadata, which powers both the
 xref backend and the capf completion.
@@ -68,13 +76,14 @@ final record's fields as candidates.
 
 ## Configuration
 
-| Variable                          | Default           | Description                                      |
-|-----------------------------------|-------------------|--------------------------------------------------|
-| `vhdl-nav-file-extensions`        | `("vhd" "vhdl")` | File extensions to scan                          |
-| `vhdl-nav-auto-reindex-on-save`   | `t`               | Re-index current file on save                    |
-| `vhdl-nav-completion-annotation`   | `t`               | Show type annotations in completion candidates   |
-| `vhdl-nav-index-batch-size`        | `20`              | Files parsed per idle cycle (0 = sync/blocking)  |
-| `vhdl-nav-debug`                   | `nil`             | Log parse details to `*Messages*`                |
+| Variable                          | Default                            | Description                                      |
+|-----------------------------------|------------------------------------|--------------------------------------------------|
+| `vhdl-nav-file-extensions`        | `("vhd" "vhdl")`                  | File extensions to scan                          |
+| `vhdl-nav-auto-reindex-on-save`   | `t`                                | Re-index current file on save                    |
+| `vhdl-nav-completion-annotation`   | `t`                                | Show type annotations in completion candidates   |
+| `vhdl-nav-index-batch-size`        | `20`                               | Files parsed per idle cycle (0 = sync/blocking)  |
+| `vhdl-nav-cache-directory`         | `~/.emacs.d/vhdl-navigator/`      | Cache directory (nil = no persistence)           |
+| `vhdl-nav-debug`                   | `nil`                              | Log parse details to `*Messages*`                |
 
 Example tuning in `config.el`:
 ```elisp
@@ -83,4 +92,7 @@ Example tuning in `config.el`:
 
 ;; Or revert to old blocking behaviour
 (setq vhdl-nav-index-batch-size 0)
+
+;; Disable persistent cache
+(setq vhdl-nav-cache-directory nil)
 ```
