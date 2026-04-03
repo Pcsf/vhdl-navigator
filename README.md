@@ -11,16 +11,24 @@ Designed for Gaisler two-process style where records are pervasive.
 - **Eldoc** — automatic minibuffer display of field types when cursor is after `.`
 - **Project-wide indexing** — scans multi-level `src/` hierarchies, caches per-project, auto-reindexes on save
 
-## Doom Emacs Installation
+## Installation
+
+### Vanilla Emacs (Linux, macOS, Windows)
+
+See `emacs-integration.org` for full instructions (manual, use-package, straight.el).
+
+Quick version — add to your `init.el`:
+```elisp
+(add-to-list 'load-path "~/.emacs.d/site-lisp/vhdl-navigator/")
+(require 'vhdl-navigator)
+(add-hook 'vhdl-mode-hook #'vhdl-navigator-mode)
+```
+
+### Doom Emacs
 
 See `doom-integration.org` for copy-paste config blocks.
 
 Quick version:
-
-```
-~/.config/doom/lisp/vhdl-navigator/
-└── vhdl-navigator.el
-```
 
 `packages.el`:
 ```elisp
@@ -40,15 +48,19 @@ Then `doom sync` and restart the daemon.
 
 ## Key Bindings
 
-| Action                   | Evil    | Emacs        |
-|--------------------------|---------|--------------|
-| Go to definition         | `gd`    | `M-.`        |
-| Go back                  | `C-o`   | `M-,`        |
-| Show record fields       | `SPC m r` | `C-c v r`  |
-| Jump to record → field   | `SPC m j` | `C-c v j`  |
-| List all definitions     | `SPC m l` | `C-c v l`  |
-| Force reindex            | `SPC m i` | `C-c v i`  |
-| Record field completion  | `.` then TAB | `.` then `C-M-i` |
+The `C-c v` prefix works everywhere (vanilla Emacs, Doom, Windows, Linux).
+Doom Evil users also get `SPC m` local-leader bindings via `doom-integration.org`.
+
+| Action                   | Emacs        | Doom Evil (extra) |
+|--------------------------|--------------|-------------------|
+| Go to definition         | `M-.`        | `gd`              |
+| Go back                  | `M-,`        | `C-o`             |
+| Show record fields       | `C-c v r`    | `SPC m r`         |
+| Jump to record → field   | `C-c v j`    | `SPC m j`         |
+| List all definitions     | `C-c v l`    | `SPC m l`         |
+| Force reindex            | `C-c v i`    | `SPC m i`         |
+| Run diagnostics          | `C-c v d`    |                   |
+| Record field completion  | `C-M-i`      | `.` then TAB      |
 
 ## How It Works
 

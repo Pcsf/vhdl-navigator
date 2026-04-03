@@ -445,7 +445,7 @@ Never signals -- returns nil on any fatal error."
                 (with-temp-file cache-file
                   (let ((print-level nil)
                         (print-length nil))
-                    (prin1 (list :version 1
+                    (prin1 (list :version 2
                                  :root root
                                  :mtimes mtimes-alist
                                  :index index-alist)
@@ -466,7 +466,7 @@ Returns (index-hash . mtimes-hash) or nil if no valid cache."
                          (read (current-buffer))))
                  (version (plist-get data :version))
                  (cached-root (plist-get data :root)))
-            (when (and (eq version 1)
+            (when (and (eq version 2)
                        (equal cached-root root))
               (let ((index (make-hash-table :test 'equal))
                     (mtimes (make-hash-table :test 'equal))
@@ -498,10 +498,12 @@ Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
       (puthash f t seen)
       (let ((cached-mtime (gethash f cached-mtimes))
             (current-mtime (ignore-errors
-                             (file-attribute-modification-time
-                              (file-attributes f)))))
+                             (float-time
+                              (file-attribute-modification-time
+                               (file-attributes f))))))
         (when (or (null cached-mtime)
-                  (not (equal cached-mtime current-mtime)))
+                  (null current-mtime)
+                  (/= cached-mtime current-mtime))
           (push f stale))))
     ;; Find deleted files (in cache but not on disk)
     (let ((deleted '()))
@@ -577,8 +579,9 @@ Returns the number of defs added."
             (count 0))
         (when (listp defs)
           (ignore-errors
-            (puthash filepath (file-attribute-modification-time
-                               (file-attributes filepath))
+            (puthash filepath (float-time
+                               (file-attribute-modification-time
+                                (file-attributes filepath)))
                      mtimes))
           (dolist (d defs)
             (when (and (vhdl-nav-def-p d)
