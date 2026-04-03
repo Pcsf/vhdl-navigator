@@ -1,0 +1,121 @@
+* VHDL Navigator — Vanilla Emacs Integration
+
+Instructions for standard (non-Doom) Emacs on any platform (Linux, macOS, Windows).
+
+** Option A: Manual load-path setup
+
+Place =vhdl-navigator.el= somewhere on your system (e.g. =~/.emacs.d/site-lisp/vhdl-navigator/=) and add the following to your =init.el=:
+
+#+begin_src emacs-lisp
+;; 1. Tell Emacs where to find the package
+(add-to-list 'load-path "~/.emacs.d/site-lisp/vhdl-navigator/")
+
+;; 2. Load and enable in vhdl-mode buffers
+(require 'vhdl-navigator)
+(add-hook 'vhdl-mode-hook #'vhdl-navigator-mode)
+
+;; 3. Customize (all optional — these are the defaults)
+(setq vhdl-nav-file-extensions '("vhd" "vhdl")
+      vhdl-nav-auto-reindex-on-save t
+      vhdl-nav-completion-annotation t
+      ;; Files parsed per idle cycle during async indexing.
+      ;; Increase for faster indexing, decrease if you notice UI pauses.
+      ;; Set to 0 for synchronous (blocking) indexing.
+      vhdl-nav-index-batch-size 20
+      ;; Persistent cache directory (set to nil to disable).
+      ;; Index is saved between sessions; only changed files are re-parsed.
+      vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory))
+#+end_src
+
+** Option B: use-package (with local path)
+
+If you use =use-package= (built-in since Emacs 29):
+
+#+begin_src emacs-lisp
+(use-package vhdl-navigator
+  :load-path "~/.emacs.d/site-lisp/vhdl-navigator/"
+  :hook (vhdl-mode . vhdl-navigator-mode)
+  :custom
+  (vhdl-nav-file-extensions '("vhd" "vhdl"))
+  (vhdl-nav-auto-reindex-on-save t)
+  (vhdl-nav-completion-annotation t)
+  (vhdl-nav-index-batch-size 20)
+  (vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory)))
+#+end_src
+
+** Option C: use-package + straight.el (from Git)
+
+#+begin_src emacs-lisp
+(use-package vhdl-navigator
+  :straight (:host github :repo "Pcsf/vhdl-navigator" :files ("*.el"))
+  :hook (vhdl-mode . vhdl-navigator-mode))
+#+end_src
+
+** Installation steps (Option A)
+
+1. Create the directory:
+   #+begin_src bash
+   mkdir -p ~/.emacs.d/site-lisp/vhdl-navigator
+   #+end_src
+
+   On Windows (PowerShell):
+   #+begin_src powershell
+   New-Item -ItemType Directory -Force -Path "$env:APPDATA\.emacs.d\site-lisp\vhdl-navigator"
+   #+end_src
+
+2. Copy =vhdl-navigator.el= into that directory.
+
+3. Add the configuration above to your =init.el=.
+
+4. Restart Emacs (or =M-x eval-buffer= on your =init.el=).
+
+** Key bindings
+
+All key bindings use the standard =C-c v= prefix and work on every platform:
+
+| Action                          | Keys         | Command                          |
+|---------------------------------+--------------+----------------------------------|
+| Go to definition                | =M-.=        | =xref-find-definitions=          |
+| Go back                         | =M-,=        | =xref-go-back=                   |
+| Show record fields (help buf)   | =C-c v r=    | =vhdl-nav-show-record=           |
+| Jump to record field            | =C-c v j=    | =vhdl-nav-jump-to-record-field=  |
+| List all definitions            | =C-c v l=    | =vhdl-nav-list-definitions=      |
+| Force re-index                  | =C-c v i=    | =vhdl-nav-reindex=               |
+| Run diagnostics                 | =C-c v d=    | =vhdl-nav-diagnose=              |
+| Record field completion         | =C-M-i=      | =completion-at-point=            |
+| Eldoc (minibuffer)              | Automatic    | Shows field type after =.=       |
+
+** Recommended companion packages
+
+For a better completion experience, consider adding one of these:
+
+#+begin_src emacs-lisp
+;; Corfu — lightweight in-buffer completion popup
+(use-package corfu
+  :ensure t
+  :init (global-corfu-mode))
+
+;; OR Company — the classic completion framework
+(use-package company
+  :ensure t
+  :hook (vhdl-mode . company-mode))
+#+end_src
+
+** Windows-specific notes
+
+- *Project detection*: Emacs uses =project.el= to find the project root (looks for =.git=, =.project=, etc.). If your VHDL project is not inside a Git repository, create a =.project= marker file at the project root:
+  #+begin_src powershell
+  New-Item -ItemType File -Path "C:\path\to\your\project\.project"
+  #+end_src
+  Or add the directory manually:
+  #+begin_src emacs-lisp
+  ;; Tell project.el about a directory that has no VCS
+  (setq project-vc-extra-root-markers '(".project"))
+  #+end_src
+
+- *Long paths*: If your project has deeply nested folders, ensure Emacs is configured for long path support. On Windows 10+, enable it via Group Policy or registry.
+
+- *Performance*: On very large projects, increase the batch size for faster indexing:
+  #+begin_src emacs-lisp
+  (setq vhdl-nav-index-batch-size 50)
+  #+end_src
