@@ -651,37 +651,55 @@ Stale files are purged from the index before re-parsing."
           vhdl-nav--async-count 0)
     (message "vhdl-navigator: async indexing %d file(s) in %s..."
              vhdl-nav--async-total (abbreviate-file-name root))
+    ;; Wait until user is idle before starting
     (setq vhdl-nav--async-timer
-          (run-with-idle-timer 0.1 t #'vhdl-nav--async-index-batch))))
+          (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))))
+
+(defun vhdl-nav--async-schedule-next ()
+  "Schedule the next async batch.
+Uses a short regular timer to chain quickly while the user is idle.
+If the user becomes active before it fires, the batch itself will
+detect this and defer until the next idle period."
+  (setq vhdl-nav--async-timer
+        (run-with-timer 0.05 nil #'vhdl-nav--async-index-batch)))
 
 (defun vhdl-nav--async-index-batch ()
-  "Parse one batch of files from the async queue."
-  (if (null vhdl-nav--async-queue)
-      ;; Done — save cache and clean up
-      (let ((root vhdl-nav--async-root))
-        (vhdl-nav--async-cancel)
-        (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
-                 vhdl-nav--async-count vhdl-nav--async-total)
-        (vhdl-nav--save-cache root))
-    ;; Parse a batch
-    (let* ((root vhdl-nav--async-root)
-           (index (gethash root vhdl-nav--project-indices))
-           (mtimes (gethash root vhdl-nav--file-mtimes))
-           (batch-size vhdl-nav-index-batch-size)
-           (processed 0))
-      (while (and vhdl-nav--async-queue (< processed batch-size))
-        (let ((f (pop vhdl-nav--async-queue)))
-          ;; Purge old defs for this file before re-parsing
-          (vhdl-nav--purge-file-from-index index f)
-          (setq vhdl-nav--async-count
-                (+ vhdl-nav--async-count
-                   (vhdl-nav--index-file-into index mtimes f))))
-        (setq processed (1+ processed)))
-      ;; Progress message
-      (let ((remaining (length vhdl-nav--async-queue)))
-        (when (> remaining 0)
-          (message "vhdl-navigator: indexing... %d/%d files remaining"
-                   remaining vhdl-nav--async-total))))))
+  "Parse one batch of files from the async queue.
+If the user is actively typing, defers until they are idle for 0.5s.
+Otherwise processes one batch and schedules the next."
+  (setq vhdl-nav--async-timer nil)
+  ;; If user is active, wait until they are idle
+  (if (null (current-idle-time))
+      (setq vhdl-nav--async-timer
+            (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))
+    ;; User is idle — do work
+    (if (null vhdl-nav--async-queue)
+        ;; Done — save cache and clean up
+        (let ((root vhdl-nav--async-root))
+          (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
+                   vhdl-nav--async-count vhdl-nav--async-total)
+          (vhdl-nav--save-cache root))
+      ;; Parse a batch
+      (let* ((root vhdl-nav--async-root)
+             (index (gethash root vhdl-nav--project-indices))
+             (mtimes (gethash root vhdl-nav--file-mtimes))
+             (batch-size vhdl-nav-index-batch-size)
+             (processed 0))
+        (while (and vhdl-nav--async-queue (< processed batch-size))
+          (let ((f (pop vhdl-nav--async-queue)))
+            ;; Purge old defs for this file before re-parsing
+            (vhdl-nav--purge-file-from-index index f)
+            (setq vhdl-nav--async-count
+                  (+ vhdl-nav--async-count
+                     (vhdl-nav--index-file-into index mtimes f))))
+          (setq processed (1+ processed)))
+        ;; Progress message
+        (let ((remaining (length vhdl-nav--async-queue)))
+          (when (> remaining 0)
+            (message "vhdl-navigator: indexing... %d/%d files remaining"
+                     remaining vhdl-nav--async-total)))
+        ;; Schedule next batch
+        (vhdl-nav--async-schedule-next)))))
 
 (defun vhdl-nav--reindex-file (filepath)
   "Re-index a single FILEPATH and merge into the project index."
