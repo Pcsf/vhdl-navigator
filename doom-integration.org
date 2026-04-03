@@ -22,7 +22,11 @@ Add the following blocks to your =config.org=.
   ;; Customize to match your project layout
   (setq vhdl-nav-file-extensions '("vhd" "vhdl")
         vhdl-nav-auto-reindex-on-save t
-        vhdl-nav-completion-annotation t)
+        vhdl-nav-completion-annotation t
+        ;; Files parsed per idle cycle during async indexing.
+        ;; Increase for faster indexing, decrease if you notice UI pauses.
+        ;; Set to 0 for synchronous (blocking) indexing.
+        vhdl-nav-index-batch-size 20)
 
   ;; Evil keybindings (leader-prefixed)
   (map! :map vhdl-navigator-mode-map

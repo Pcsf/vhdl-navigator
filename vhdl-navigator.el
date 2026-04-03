@@ -57,6 +57,13 @@
   :type 'boolean
   :group 'vhdl-navigator)
 
+(defcustom vhdl-nav-index-batch-size 20
+  "Number of files to parse per idle cycle during async indexing.
+Larger values finish faster but may cause brief UI pauses.
+Set to 0 to use synchronous (blocking) indexing."
+  :type 'integer
+  :group 'vhdl-navigator)
+
 ;; ---------------------------------------------------------------------------
 ;; Internal data structures
 ;; ---------------------------------------------------------------------------
@@ -80,6 +87,22 @@
 ;; Per-project file mtimes
 (defvar vhdl-nav--file-mtimes (make-hash-table :test 'equal)
   "Cache mapping project root to (file -> mtime) hash-table.")
+
+;; Async indexing state
+(defvar vhdl-nav--async-timer nil
+  "Idle timer for async indexing, or nil when not indexing.")
+
+(defvar vhdl-nav--async-queue nil
+  "List of files remaining to be parsed in the current async run.")
+
+(defvar vhdl-nav--async-root nil
+  "Project root for the current async indexing run.")
+
+(defvar vhdl-nav--async-total 0
+  "Total number of files in the current async run (for progress).")
+
+(defvar vhdl-nav--async-count 0
+  "Number of definitions found so far in the current async run.")
 
 ;; ---------------------------------------------------------------------------
 ;; Project root detection
@@ -391,16 +414,25 @@ Never signals -- returns nil on any fatal error."
 ;; ---------------------------------------------------------------------------
 
 (defun vhdl-nav--get-index (&optional force)
-  "Get or build the VHDL index for the current project."
+  "Get or build the VHDL index for the current project.
+When FORCE is non-nil, rebuild synchronously."
   (let* ((root (vhdl-nav--project-root))
          (index (gethash root vhdl-nav--project-indices)))
     (when (or force (not index))
-      (setq index (vhdl-nav--build-index root))
-      (puthash root index vhdl-nav--project-indices))
+      (if force
+          ;; Forced: synchronous full rebuild
+          (progn
+            (vhdl-nav--async-cancel)
+            (setq index (vhdl-nav--build-index-sync root))
+            (puthash root index vhdl-nav--project-indices))
+        ;; First access: create empty index and start async build
+        (setq index (make-hash-table :test 'equal))
+        (puthash root index vhdl-nav--project-indices)
+        (vhdl-nav--build-index-async root)))
     index))
 
-(defun vhdl-nav--build-index (root)
-  "Build a fresh index for project at ROOT."
+(defun vhdl-nav--build-index-sync (root)
+  "Build a fresh index for project at ROOT synchronously."
   (message "vhdl-navigator: indexing %s..." (abbreviate-file-name root))
   (let ((index (make-hash-table :test 'equal))
         (files (vhdl-nav--find-vhdl-files root))
@@ -426,6 +458,73 @@ Never signals -- returns nil on any fatal error."
     (message "vhdl-navigator: indexed %d definitions from %d files"
              count (length (or files '())))
     index))
+
+(defun vhdl-nav--async-cancel ()
+  "Cancel any in-progress async indexing."
+  (when vhdl-nav--async-timer
+    (cancel-timer vhdl-nav--async-timer)
+    (setq vhdl-nav--async-timer nil
+          vhdl-nav--async-queue nil)))
+
+(defun vhdl-nav--build-index-async (root)
+  "Start async indexing for project at ROOT.
+Parses `vhdl-nav-index-batch-size' files per idle cycle."
+  (vhdl-nav--async-cancel)
+  (let ((files (vhdl-nav--find-vhdl-files root)))
+    (if (or (null files) (<= vhdl-nav-index-batch-size 0))
+        ;; No files or sync mode requested: fall back to sync
+        (let ((index (vhdl-nav--build-index-sync root)))
+          (puthash root index vhdl-nav--project-indices))
+      ;; Ensure mtimes table exists
+      (unless (gethash root vhdl-nav--file-mtimes)
+        (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
+      (setq vhdl-nav--async-root root
+            vhdl-nav--async-queue files
+            vhdl-nav--async-total (length files)
+            vhdl-nav--async-count 0)
+      (message "vhdl-navigator: async indexing %d files in %s..."
+               vhdl-nav--async-total (abbreviate-file-name root))
+      (setq vhdl-nav--async-timer
+            (run-with-idle-timer 0.1 t #'vhdl-nav--async-index-batch)))))
+
+(defun vhdl-nav--async-index-batch ()
+  "Parse one batch of files from the async queue."
+  (if (null vhdl-nav--async-queue)
+      ;; Done
+      (progn
+        (vhdl-nav--async-cancel)
+        (message "vhdl-navigator: async indexing complete — %d definitions from %d files"
+                 vhdl-nav--async-count vhdl-nav--async-total))
+    ;; Parse a batch
+    (let* ((root vhdl-nav--async-root)
+           (index (gethash root vhdl-nav--project-indices))
+           (mtimes (gethash root vhdl-nav--file-mtimes))
+           (batch-size vhdl-nav-index-batch-size)
+           (processed 0))
+      (while (and vhdl-nav--async-queue (< processed batch-size))
+        (let ((f (pop vhdl-nav--async-queue)))
+          (condition-case err
+              (let ((defs (vhdl-nav--parse-file f)))
+                (when (listp defs)
+                  (ignore-errors
+                    (puthash f (file-attribute-modification-time
+                                (file-attributes f))
+                             mtimes))
+                  (dolist (d defs)
+                    (when (and (vhdl-nav-def-p d)
+                               (stringp (vhdl-nav-def-name d)))
+                      (let* ((name (vhdl-nav-def-name d))
+                             (existing (gethash name index)))
+                        (puthash name (cons d existing) index))))
+                  (setq vhdl-nav--async-count
+                        (+ vhdl-nav--async-count (length defs)))))
+            (error (message "vhdl-navigator: error on %s: %s" f err))))
+        (setq processed (1+ processed)))
+      ;; Progress message
+      (let ((remaining (length vhdl-nav--async-queue)))
+        (when (> remaining 0)
+          (message "vhdl-navigator: indexing... %d/%d files remaining"
+                   remaining vhdl-nav--async-total))))))
 
 (defun vhdl-nav--reindex-file (filepath)
   "Re-index a single FILEPATH and merge into the project index."

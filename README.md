@@ -52,11 +52,35 @@ Then `doom sync` and restart the daemon.
 
 ## How It Works
 
-On first activation, the package scans all `.vhd` / `.vhdl` files under the
-project root, building a hash-table index of definitions. On each file save, only
-that file is re-parsed (incremental). The index maps symbol names to location +
-type metadata, which powers both the xref backend and the capf completion.
+On first activation, the package discovers all `.vhd` / `.vhdl` files under the
+project root and indexes them **asynchronously** in the background using idle
+timers. Files are parsed in small batches (default 20 per idle cycle), so Emacs
+stays responsive even for large projects with hundreds of files. Features
+(completion, xref, eldoc) work immediately with whatever has been indexed so far.
+On each file save, only that file is re-parsed (incremental).
+
+The index maps symbol names to location + type metadata, which powers both the
+xref backend and the capf completion.
 
 For dot-completion, the package walks backward from the cursor over the dot-chain
 (`r.sub.field.`), resolves each segment's type through the index, and offers the
 final record's fields as candidates.
+
+## Configuration
+
+| Variable                          | Default           | Description                                      |
+|-----------------------------------|-------------------|--------------------------------------------------|
+| `vhdl-nav-file-extensions`        | `("vhd" "vhdl")` | File extensions to scan                          |
+| `vhdl-nav-auto-reindex-on-save`   | `t`               | Re-index current file on save                    |
+| `vhdl-nav-completion-annotation`   | `t`               | Show type annotations in completion candidates   |
+| `vhdl-nav-index-batch-size`        | `20`              | Files parsed per idle cycle (0 = sync/blocking)  |
+| `vhdl-nav-debug`                   | `nil`             | Log parse details to `*Messages*`                |
+
+Example tuning in `config.el`:
+```elisp
+;; Parse 50 files per idle tick (faster, slightly choppier)
+(setq vhdl-nav-index-batch-size 50)
+
+;; Or revert to old blocking behaviour
+(setq vhdl-nav-index-batch-size 0)
+```
