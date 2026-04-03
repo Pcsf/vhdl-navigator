@@ -26,7 +26,10 @@ Add the following blocks to your =config.org=.
         ;; Files parsed per idle cycle during async indexing.
         ;; Increase for faster indexing, decrease if you notice UI pauses.
         ;; Set to 0 for synchronous (blocking) indexing.
-        vhdl-nav-index-batch-size 20)
+        vhdl-nav-index-batch-size 20
+        ;; Persistent cache directory (set to nil to disable).
+        ;; Index is saved between sessions; only changed files are re-parsed.
+        vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory))
 
   ;; Evil keybindings (leader-prefixed)
   (map! :map vhdl-navigator-mode-map
