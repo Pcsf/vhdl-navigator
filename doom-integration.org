@@ -29,7 +29,10 @@ Add the following blocks to your =config.org=.
         vhdl-nav-index-batch-size 20
         ;; Persistent cache directory (set to nil to disable).
         ;; Index is saved between sessions; only changed files are re-parsed.
-        vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory))
+        vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory)
+        ;; Check for files changed between sessions (runs after 2 s of idle time).
+        ;; Set to nil on network-mounted file-systems to avoid any startup scan.
+        vhdl-nav-startup-check t)
 
   ;; Evil keybindings (leader-prefixed)
   (map! :map vhdl-navigator-mode-map

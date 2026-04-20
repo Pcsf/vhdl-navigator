@@ -24,7 +24,10 @@ Place =vhdl-navigator.el= somewhere on your system (e.g. =~/.emacs.d/site-lisp/v
       vhdl-nav-index-batch-size 20
       ;; Persistent cache directory (set to nil to disable).
       ;; Index is saved between sessions; only changed files are re-parsed.
-      vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory))
+      vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory)
+      ;; Check for files changed between sessions (runs after 2 s of idle time).
+      ;; Set to nil on network-mounted file-systems to avoid any startup scan.
+      vhdl-nav-startup-check t)
 #+end_src
 
 ** Option B: use-package (with local path)
@@ -40,7 +43,9 @@ If you use =use-package= (built-in since Emacs 29):
   (vhdl-nav-auto-reindex-on-save t)
   (vhdl-nav-completion-annotation t)
   (vhdl-nav-index-batch-size 20)
-  (vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory)))
+  (vhdl-nav-cache-directory (expand-file-name "vhdl-navigator/" user-emacs-directory))
+  ;; Set to nil on network-mounted file-systems to skip the idle-time startup scan.
+  (vhdl-nav-startup-check t))
 #+end_src
 
 ** Option C: use-package + straight.el (from Git)
