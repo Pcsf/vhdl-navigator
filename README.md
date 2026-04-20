@@ -5,13 +5,41 @@ Designed for Gaisler two-process style where records are pervasive.
 
 ## Features
 
-- **Dot-completion for record fields** — type `r.` and a completion popup appears automatically with field candidates and type annotations, regardless of your completion framework (Corfu, Vertico, Company)
+- **Dot-completion for record fields** — type `r.` and get field candidates with type annotations; requires a completion frontend (Corfu or Company) for the inline popup — see [Installation](#installation)
 - **Nested record resolution** — `uarti.cfg.` resolves through `uart_in_type → cfg : uart_config_type → fields`
 - **Go-to-definition** (`gd` / `M-.`) — jumps to the source of records, entities, architectures, signals, constants, variables, functions, procedures, and packages
 - **Eldoc** — automatic minibuffer display of field types when cursor is after `.`
 - **Project-wide indexing** — scans multi-level `src/` hierarchies, caches per-project, auto-reindexes on save
 
 ## Installation
+
+### Required: completion frontend for the inline popup
+
+This package provides candidates through Emacs's standard
+`completion-at-point` mechanism (capf). What renders those candidates as
+an **inline dropdown** is a separate completion frontend. Without one,
+Emacs shows the built-in `*Completions*` buffer instead of a popup.
+
+**Doom Emacs** ships Corfu pre-configured — no extra steps needed.
+
+**Vanilla Emacs** — install one of these:
+
+```elisp
+;; Option A: Corfu (lightweight, recommended)
+(use-package corfu
+  :ensure t
+  :init (global-corfu-mode))
+
+;; Option B: Company (classic, heavier)
+(use-package company
+  :ensure t
+  :hook (vhdl-mode . company-mode))
+```
+
+`M-x package-install RET corfu RET` is enough if you do not use
+`use-package`. Either one integrates with `completion-at-point`
+automatically — no further configuration is needed for the dot-completion
+to produce a popup.
 
 ### Vanilla Emacs (Linux, macOS, Windows)
 

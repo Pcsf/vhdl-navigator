@@ -87,24 +87,35 @@ All key bindings use the standard =C-c v= prefix and work on every platform:
 | List all definitions            | =C-c v l=    | =vhdl-nav-list-definitions=      |
 | Force re-index                  | =C-c v i=    | =vhdl-nav-reindex=               |
 | Run diagnostics                 | =C-c v d=    | =vhdl-nav-diagnose=              |
-| Record field completion         | =C-M-i=      | =completion-at-point=            |
+| Record field completion         | =.= or =C-M-i= | popup requires Corfu or Company  |
 | Eldoc (minibuffer)              | Automatic    | Shows field type after =.=       |
 
-** Recommended companion packages
+** Required: completion frontend for the inline popup
 
-For a better completion experience, consider adding one of these:
+This package exposes candidates through Emacs's standard
+=completion-at-point= mechanism (capf).  What renders those candidates as
+an *inline dropdown* is a separate completion frontend.  Without one,
+Emacs shows the built-in =*Completions*= buffer instead of a popup —
+functional but not the dropdown experience most users expect.
+
+Install one of the following before using dot-completion:
 
 #+begin_src emacs-lisp
-;; Corfu — lightweight in-buffer completion popup
+;; Option A: Corfu — lightweight in-buffer popup (recommended)
 (use-package corfu
   :ensure t
   :init (global-corfu-mode))
 
-;; OR Company — the classic completion framework
+;; Option B: Company — the classic completion framework
 (use-package company
   :ensure t
   :hook (vhdl-mode . company-mode))
 #+end_src
+
+=M-x package-install RET corfu RET= is enough if you do not use
+=use-package=.  Either frontend integrates with =completion-at-point=
+automatically; no additional configuration is required for the
+dot-completion popup to appear.
 
 ** Windows-specific notes
 
