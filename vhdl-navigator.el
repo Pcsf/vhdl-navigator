@@ -566,19 +566,28 @@ Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
   (remhash root vhdl-nav--watcher-debounces)
   (let* ((queue  (gethash root vhdl-nav--watcher-queue))
          (index  (gethash root vhdl-nav--project-indices))
-         (mtimes (gethash root vhdl-nav--file-mtimes))
-         (reparse '())
-         (purge '()))
-    (when (and queue index mtimes)
-      (maphash (lambda (f action)
-                 (if (eq action 'deleted) (push f purge) (push f reparse)))
-               queue)
-      (remhash root vhdl-nav--watcher-queue)
-      (dolist (f purge)
-        (vhdl-nav--purge-file-from-index index f)
-        (remhash f mtimes))
-      (when reparse
-        (vhdl-nav--build-index-async-files root reparse)))))
+         (mtimes (gethash root vhdl-nav--file-mtimes)))
+    (cond
+     ;; Nothing queued — nothing to do
+     ((null queue))
+     ;; Index not yet loaded — reschedule so events are not lost
+     ((or (null index) (null mtimes))
+      (puthash root
+               (run-with-idle-timer 2.0 nil #'vhdl-nav--flush-watcher-queue root)
+               vhdl-nav--watcher-debounces))
+     ;; Index ready — process the queue
+     (t
+      (let ((reparse '())
+            (purge '()))
+        (maphash (lambda (f action)
+                   (if (eq action 'deleted) (push f purge) (push f reparse)))
+                 queue)
+        (remhash root vhdl-nav--watcher-queue)
+        (dolist (f purge)
+          (vhdl-nav--purge-file-from-index index f)
+          (remhash f mtimes))
+        (when reparse
+          (vhdl-nav--build-index-async-files root reparse)))))))
 
 (defun vhdl-nav--watch-dirs (root dirs)
   "Add filenotify watchers for DIRS belonging to project ROOT.
@@ -764,11 +773,13 @@ Returns the number of defs added."
 (defun vhdl-nav--build-index-async-files (root files)
   "Start async indexing of FILES for project at ROOT.
 Parses `vhdl-nav-index-batch-size' files per idle cycle.
-Stale files are purged from the index before re-parsing."
-  (vhdl-nav--async-cancel)
+Stale files are purged from the index before re-parsing.
+If an async run for ROOT is already in progress, the new files are merged
+into the existing queue rather than cancelling the ongoing work."
   (if (or (null files) (<= vhdl-nav-index-batch-size 0))
       ;; No files or sync mode: fall back to sync for just these files
       (when files
+        (vhdl-nav--async-cancel)
         (let ((index (or (gethash root vhdl-nav--project-indices)
                          (make-hash-table :test 'equal)))
               (mtimes (or (gethash root vhdl-nav--file-mtimes)
@@ -783,18 +794,33 @@ Stale files are purged from the index before re-parsing."
                    count (length files))
           (vhdl-nav--save-cache root)
           (vhdl-nav--setup-watchers-from-index root)))
-    ;; Ensure mtimes table exists
-    (unless (gethash root vhdl-nav--file-mtimes)
-      (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
-    (setq vhdl-nav--async-root root
-          vhdl-nav--async-queue files
-          vhdl-nav--async-total (length files)
-          vhdl-nav--async-count 0)
-    (message "vhdl-navigator: async indexing %d file(s) in %s..."
-             vhdl-nav--async-total (abbreviate-file-name root))
-    ;; Wait until user is idle before starting
-    (setq vhdl-nav--async-timer
-          (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))))
+    ;; Async path
+    (if (and (equal vhdl-nav--async-root root) vhdl-nav--async-queue)
+        ;; Same project already indexing — merge new files in to avoid
+        ;; cancelling in-progress work.  Prepend so recent changes are
+        ;; picked up in the next batch.
+        (let ((new-files (seq-remove
+                          (lambda (f) (member f vhdl-nav--async-queue))
+                          files)))
+          (when new-files
+            (setq vhdl-nav--async-queue (append new-files vhdl-nav--async-queue))
+            (cl-incf vhdl-nav--async-total (length new-files)))
+          ;; Restart timer if it expired between batches
+          (unless vhdl-nav--async-timer
+            (setq vhdl-nav--async-timer
+                  (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))))
+      ;; Different project or idle queue — start fresh
+      (vhdl-nav--async-cancel)
+      (unless (gethash root vhdl-nav--file-mtimes)
+        (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
+      (setq vhdl-nav--async-root root
+            vhdl-nav--async-queue files
+            vhdl-nav--async-total (length files)
+            vhdl-nav--async-count 0)
+      (message "vhdl-navigator: async indexing %d file(s) in %s..."
+               vhdl-nav--async-total (abbreviate-file-name root))
+      (setq vhdl-nav--async-timer
+            (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch)))))
 
 (defun vhdl-nav--async-schedule-next ()
   "Schedule the next async batch.
