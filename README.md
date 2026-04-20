@@ -64,46 +64,58 @@ Doom Evil users also get `SPC m` local-leader bindings via `doom-integration.org
 
 ## How It Works
 
-On first activation, the package checks for a **persistent cache** on disk. If a
-valid cache exists, it loads instantly and only re-parses files whose modification
-time has changed since the last session. New and modified files are indexed
-**asynchronously** in the background using idle timers (default 20 files per idle
-cycle), so Emacs stays responsive even for large projects. Deleted files are
-automatically pruned from the index.
+On first activation the package looks for a **persistent cache** on disk. If one
+exists it is loaded and made active immediately — Emacs never scans the project
+tree at startup. Features (completion, xref, Eldoc) are available from the first
+keypress with whatever the cache contains.
 
-If no cache exists (first run), all files are indexed asynchronously from scratch.
-Features (completion, xref, eldoc) work immediately with whatever has been indexed
-so far. On each file save, only that file is re-parsed and the cache is updated.
+**Three layers keep the index fresh without ever blocking the UI:**
+
+1. **filenotify watchers** — as soon as the cache is installed the package
+   registers OS-level file-system watchers on every directory that contains VHDL
+   files. When a file is created, modified, or deleted (including by external tools
+   such as git or a build system) the OS event is received, debounced for 1 second
+   of idle quiet, and only the affected files are re-parsed in the background.
+   This covers all changes that happen while Emacs is running.
+
+2. **Deferred startup check** — to catch files that changed *between* Emacs
+   sessions, a background idle-timer task runs after 2 seconds of idle time on
+   startup. It compares on-disk modification times against the cached values and
+   queues only the changed files for async re-indexing. If the user starts typing
+   before it fires it reschedules itself. On network file-systems this check can
+   be disabled entirely (see `vhdl-nav-startup-check` below).
+
+3. **After-save hook** — any file edited and saved inside Emacs is always
+   re-indexed immediately, regardless of the above two layers.
+
+If no cache exists (first run), an empty index is installed and all project files
+are parsed asynchronously in the background using idle timers (default 20 files
+per idle cycle). Features work with whatever has been indexed so far.
 
 The cache is stored under `~/.emacs.d/vhdl-navigator/` (one file per project,
 named by MD5 of the project root). Set `vhdl-nav-cache-directory` to nil to
 disable persistence.
 
-The index maps symbol names to location + type metadata, which powers both the
-xref backend and the capf completion.
-
-For dot-completion, the package walks backward from the cursor over the dot-chain
-(`r.sub.field.`), resolves each segment's type through the index, and offers the
-final record's fields as candidates.
-
 ## Configuration
 
-| Variable                          | Default                            | Description                                      |
-|-----------------------------------|------------------------------------|--------------------------------------------------|
-| `vhdl-nav-file-extensions`        | `("vhd" "vhdl")`                  | File extensions to scan                          |
-| `vhdl-nav-auto-reindex-on-save`   | `t`                                | Re-index current file on save                    |
-| `vhdl-nav-completion-annotation`   | `t`                                | Show type annotations in completion candidates   |
-| `vhdl-nav-index-batch-size`        | `20`                               | Files parsed per idle cycle (0 = sync/blocking)  |
-| `vhdl-nav-cache-directory`         | `~/.emacs.d/vhdl-navigator/`      | Cache directory (nil = no persistence)           |
-| `vhdl-nav-debug`                   | `nil`                              | Log parse details to `*Messages*`                |
+| Variable                          | Default                            | Description                                                       |
+|-----------------------------------|------------------------------------|-------------------------------------------------------------------|
+| `vhdl-nav-file-extensions`        | `("vhd" "vhdl")`                  | File extensions to scan                                           |
+| `vhdl-nav-auto-reindex-on-save`   | `t`                                | Re-index current file on save                                     |
+| `vhdl-nav-completion-annotation`   | `t`                                | Show type annotations in completion candidates                    |
+| `vhdl-nav-index-batch-size`        | `20`                               | Files parsed per idle cycle (0 = sync/blocking)                   |
+| `vhdl-nav-cache-directory`         | `~/.emacs.d/vhdl-navigator/`      | Cache directory (nil = no persistence)                            |
+| `vhdl-nav-startup-check`           | `t`                                | Check for between-session changes during idle time at startup     |
+| `vhdl-nav-debug`                   | `nil`                              | Log parse details to `*Messages*`                                 |
 
 Example tuning in `config.el`:
 ```elisp
 ;; Parse 50 files per idle tick (faster, slightly choppier)
 (setq vhdl-nav-index-batch-size 50)
 
-;; Or revert to old blocking behaviour
-(setq vhdl-nav-index-batch-size 0)
+;; On NFS or other slow mounts: skip the idle-time mtime scan entirely.
+;; filenotify and after-save-hook still keep the index up to date.
+(setq vhdl-nav-startup-check nil)
 
 ;; Disable persistent cache
 (setq vhdl-nav-cache-directory nil)
