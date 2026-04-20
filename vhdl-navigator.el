@@ -1178,6 +1178,23 @@ Otherwise processes one batch and schedules the next."
             (insert (format "  L%d\n" (vhdl-nav-def-line d)))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Dot-triggered completion
+;; ---------------------------------------------------------------------------
+
+(defun vhdl-nav--post-dot-completion ()
+  "Trigger field completion immediately after '.' is typed.
+Most completion frontends (Corfu, Company) only auto-trigger after word
+characters, so they miss the dot.  This hook calls `completion-at-point'
+right after insertion — but only when the dot follows an identifier that
+we can resolve, and only outside comments and string literals."
+  (when (and (eq last-command-event ?.)
+             (let ((ppss (syntax-ppss)))
+               (not (or (nth 4 ppss)   ; inside comment
+                        (nth 3 ppss)))) ; inside string
+             (vhdl-nav--dot-prefix))   ; looks like a dot-chain we can resolve
+    (ignore-errors (completion-at-point))))
+
+;; ---------------------------------------------------------------------------
 ;; Minor mode
 ;; ---------------------------------------------------------------------------
 
@@ -1203,6 +1220,8 @@ Otherwise processes one batch and schedules the next."
                   #'vhdl-nav-eldoc-function nil t)
         (add-hook 'after-save-hook
                   #'vhdl-nav--after-save-hook nil t)
+        (add-hook 'post-self-insert-hook
+                  #'vhdl-nav--post-dot-completion nil t)
         ;; Defer index loading to idle time so the buffer opens instantly
         (run-with-idle-timer 0.3 nil #'vhdl-nav--get-index))
     (remove-hook 'completion-at-point-functions
@@ -1213,6 +1232,8 @@ Otherwise processes one batch and schedules the next."
                  #'vhdl-nav-eldoc-function t)
     (remove-hook 'after-save-hook
                  #'vhdl-nav--after-save-hook t)
+    (remove-hook 'post-self-insert-hook
+                 #'vhdl-nav--post-dot-completion t)
     ;; Stop watchers only when no other vhdl-navigator buffer is open for this project
     (let* ((root (vhdl-nav--project-root))
            (still-active
