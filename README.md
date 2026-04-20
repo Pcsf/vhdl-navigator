@@ -5,7 +5,7 @@ Designed for Gaisler two-process style where records are pervasive.
 
 ## Features
 
-- **Dot-completion for record fields** — type `r.` and get field candidates with type annotations via your completion framework (Corfu, Vertico, Company)
+- **Dot-completion for record fields** — type `r.` and a completion popup appears automatically with field candidates and type annotations, regardless of your completion framework (Corfu, Vertico, Company)
 - **Nested record resolution** — `uarti.cfg.` resolves through `uart_in_type → cfg : uart_config_type → fields`
 - **Go-to-definition** (`gd` / `M-.`) — jumps to the source of records, entities, architectures, signals, constants, variables, functions, procedures, and packages
 - **Eldoc** — automatic minibuffer display of field types when cursor is after `.`
