@@ -37,7 +37,7 @@ emacs --batch -f batch-byte-compile vhdl-navigator.el
 
 The package is structured as a single file with these logical sections:
 
-1. **Customization** — `defcustom` vars: `vhdl-nav-file-extensions`, `vhdl-nav-auto-reindex-on-save`, `vhdl-nav-completion-annotation`, `vhdl-nav-debug`, `vhdl-nav-index-batch-size`, `vhdl-nav-cache-directory`.
+1. **Customization** — `defcustom` vars: `vhdl-nav-file-extensions`, `vhdl-nav-auto-reindex-on-save`, `vhdl-nav-completion-annotation`, `vhdl-nav-debug`, `vhdl-nav-index-batch-size`, `vhdl-nav-cache-directory`, `vhdl-nav-startup-check`.
 
 2. **Data structure** — `vhdl-nav-def` (cl-defstruct) holds: `name`, `kind` (one of `record field entity architecture signal constant variable function procedure package type`), `type-name`, `parent`, `file`, `line`, `fields` (for records: list of `(field-name . type-string)`).
 
@@ -50,16 +50,20 @@ The package is structured as a single file with these logical sections:
    - `vhdl-nav--file-mtimes`: root → (file → mtime) hash-table
    - Index stores *lists* of defs per name to handle duplicates across files.
    - Incremental reindex (`vhdl-nav--reindex-file`) removes all defs from a file then re-adds them.
-   - **Persistent cache** (`vhdl-nav--save-cache` / `vhdl-nav--load-cache`): the full index + mtimes are serialized to `~/.emacs.d/vhdl-navigator/<md5>.el` via `prin1`/`read`. On load, `vhdl-nav--diff-files` compares cached mtimes against disk to find stale/new/deleted files — only those are re-parsed. Cache is updated after async completion, sync rebuild, and single-file reindex.
+   - **Persistent cache** (`vhdl-nav--save-cache` / `vhdl-nav--load-cache`): the full index + mtimes are serialized to `~/.emacs.d/vhdl-navigator/<md5>.el` via `prin1`/`read`. The cache is trusted immediately on load — no blocking scan. `vhdl-nav--diff-files` is only called later, from the deferred startup check. Cache is updated after async completion, sync rebuild, and single-file reindex.
    - **Async indexing** (`vhdl-nav--build-index-async-files`): files are parsed in batches of `vhdl-nav-index-batch-size` per idle timer tick (0.1s interval). This keeps the UI responsive for large projects. Features work with the partial index as it builds. A synchronous fallback (`vhdl-nav--build-index-sync`) is used for forced reindex or when batch size is 0.
+
+6. **File-system watcher** (`vhdl-nav--watch-dirs` / `vhdl-nav--setup-watchers-from-index`): after the index is ready, `filenotify` watchers are registered on every directory that contains VHDL files. The callback (`vhdl-nav--watcher-callback`) filters events to VHDL files, writes them into a per-project queue, and schedules a 1 s per-project idle debounce. `vhdl-nav--flush-watcher-queue` then purges deleted files and calls `vhdl-nav--build-index-async-files` for changed/created ones. State: `vhdl-nav--watchers` (root → descriptor list), `vhdl-nav--watcher-debounces` (root → timer), `vhdl-nav--watcher-queue` (root → file→action hash).
+
+7. **Deferred startup check** (`vhdl-nav--deferred-startup-check`): scheduled via `run-with-idle-timer` (2 s) after cache load to catch files changed between Emacs sessions. Calls `vhdl-nav--diff-files` only when idle; if the user starts typing it reschedules itself. Controlled by `vhdl-nav-startup-check` (set to nil to skip on slow mounts).
 
 6. **Dot-chain resolver** — walks backward over `a.b.c.` from cursor, resolves each segment's type through the index via `vhdl-nav--resolve-type` → `vhdl-nav--strip-type-qualifiers` → `vhdl-nav--find-record`, then returns the final record's fields as capf candidates.
 
-7. **xref backend** (`vhdl-nav--xref-backend`, `cl-defmethod xref-backend-definitions`) — looks up the symbol at point in the index and returns `xref-make` locations.
+8. **xref backend** (`vhdl-nav--xref-backend`, `cl-defmethod xref-backend-definitions`) — looks up the symbol at point in the index and returns `xref-make` locations.
 
-8. **Eldoc** — `vhdl-nav--eldoc-function` fires when cursor is after `.`, resolves the chain, and returns a field-type string.
+9. **Eldoc** — `vhdl-nav--eldoc-function` fires when cursor is after `.`, resolves the chain, and returns a field-type string.
 
-9. **Minor mode** (`vhdl-navigator-mode`) — adds capf, xref backend, Eldoc function, and `after-save-hook`; removes them on disable.
+10. **Minor mode** (`vhdl-navigator-mode`) — adds capf, xref backend, Eldoc function, and `after-save-hook`; removes them on disable. On enable, defers `vhdl-nav--get-index` to a 0.3 s idle timer (so the buffer opens instantly). On disable, tears down filenotify watchers only if no other `vhdl-navigator-mode` buffer in the same project remains open.
 
 ## Doom Emacs Installation
 
