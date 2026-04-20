@@ -63,7 +63,9 @@ The package is structured as a single file with these logical sections:
 
 9. **Eldoc** — `vhdl-nav--eldoc-function` fires when cursor is after `.`, resolves the chain, and returns a field-type string.
 
-10. **Minor mode** (`vhdl-navigator-mode`) — adds capf, xref backend, Eldoc function, and `after-save-hook`; removes them on disable. On enable, defers `vhdl-nav--get-index` to a 0.3 s idle timer (so the buffer opens instantly). On disable, tears down filenotify watchers only if no other `vhdl-navigator-mode` buffer in the same project remains open.
+10. **Dot-triggered completion** (`vhdl-nav--post-dot-completion`): a `post-self-insert-hook` that fires `completion-at-point` immediately after `.` is typed, but only when `vhdl-nav--dot-prefix` confirms the dot follows a resolvable identifier and the cursor is outside a comment or string. This is needed because most completion frontends (Corfu, Company) only auto-trigger after word characters and would otherwise ignore `.`.
+
+11. **Minor mode** (`vhdl-navigator-mode`) — adds capf, xref backend, Eldoc function, `after-save-hook`, and the `post-self-insert-hook` for dot-triggered completion; removes them on disable. On enable, defers `vhdl-nav--get-index` to a 0.3 s idle timer (so the buffer opens instantly). On disable, tears down filenotify watchers only if no other `vhdl-navigator-mode` buffer in the same project remains open.
 
 ## Doom Emacs Installation
 
