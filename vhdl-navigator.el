@@ -1,7 +1,7 @@
 ;;; vhdl-navigator.el --- VHDL record visualizer & go-to-definition -*- lexical-binding: t; -*-
 
 ;; Author: Paulo (generated with Claude)
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1") (project "0.9"))
 ;; Keywords: languages, vhdl, navigation, completion
 ;; URL: https://github.com/your-user/vhdl-navigator
@@ -72,6 +72,16 @@ Set to nil to disable persistent caching."
   :type '(choice directory (const nil))
   :group 'vhdl-navigator)
 
+(defcustom vhdl-nav-startup-check t
+  "When non-nil, verify cache freshness during idle time on startup.
+The check runs asynchronously after the cache is already loaded and
+active, so Emacs never blocks.  Set to nil to skip it entirely and
+rely solely on file-notification events and `after-save-hook' for
+index updates — useful on network-mounted file-systems where even an
+idle-time scan is undesirably slow."
+  :type 'boolean
+  :group 'vhdl-navigator)
+
 ;; ---------------------------------------------------------------------------
 ;; Internal data structures
 ;; ---------------------------------------------------------------------------
@@ -111,6 +121,16 @@ Set to nil to disable persistent caching."
 
 (defvar vhdl-nav--async-count 0
   "Number of definitions found so far in the current async run.")
+
+;; Per-project file-system watchers (filenotify)
+(defvar vhdl-nav--watchers (make-hash-table :test 'equal)
+  "Map from project root to list of filenotify watch descriptors.")
+
+(defvar vhdl-nav--watcher-debounces (make-hash-table :test 'equal)
+  "Map from project root to per-project debounce timer for file events.")
+
+(defvar vhdl-nav--watcher-queue (make-hash-table :test 'equal)
+  "Map from project root to hash of file→action pairs pending processing.")
 
 ;; ---------------------------------------------------------------------------
 ;; Project root detection
@@ -514,13 +534,137 @@ Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
       (list :stale stale :deleted deleted))))
 
 ;; ---------------------------------------------------------------------------
+;; File-system watcher (filenotify)
+;; ---------------------------------------------------------------------------
+
+(defun vhdl-nav--watcher-callback (root event)
+  "Handle a filenotify EVENT belonging to project ROOT."
+  (let* ((action (nth 1 event))
+         (file   (nth 2 event))
+         (file2  (nth 3 event))
+         (vhd-re (concat "\\." (regexp-opt vhdl-nav-file-extensions t) "\\'")))
+    (when (or (and (stringp file)  (string-match-p vhd-re file))
+              (and (stringp file2) (string-match-p vhd-re file2)))
+      (let ((queue (or (gethash root vhdl-nav--watcher-queue)
+                       (let ((h (make-hash-table :test 'equal)))
+                         (puthash root h vhdl-nav--watcher-queue)
+                         h))))
+        (pcase action
+          ('deleted (puthash file  'deleted queue))
+          ('renamed (puthash file  'deleted queue)
+                    (when file2 (puthash file2 'changed queue)))
+          (_        (puthash file  'changed queue))))
+      ;; Per-project debounce: accumulate events then flush after 1 s of quiet
+      (let ((existing (gethash root vhdl-nav--watcher-debounces)))
+        (when existing (cancel-timer existing)))
+      (puthash root
+               (run-with-idle-timer 1.0 nil #'vhdl-nav--flush-watcher-queue root)
+               vhdl-nav--watcher-debounces))))
+
+(defun vhdl-nav--flush-watcher-queue (root)
+  "Process all queued file-change events for project ROOT."
+  (remhash root vhdl-nav--watcher-debounces)
+  (let* ((queue  (gethash root vhdl-nav--watcher-queue))
+         (index  (gethash root vhdl-nav--project-indices))
+         (mtimes (gethash root vhdl-nav--file-mtimes))
+         (reparse '())
+         (purge '()))
+    (when (and queue index mtimes)
+      (maphash (lambda (f action)
+                 (if (eq action 'deleted) (push f purge) (push f reparse)))
+               queue)
+      (remhash root vhdl-nav--watcher-queue)
+      (dolist (f purge)
+        (vhdl-nav--purge-file-from-index index f)
+        (remhash f mtimes))
+      (when reparse
+        (vhdl-nav--build-index-async-files root reparse)))))
+
+(defun vhdl-nav--watch-dirs (root dirs)
+  "Add filenotify watchers for DIRS belonging to project ROOT.
+Silently does nothing if filenotify is unavailable or ROOT is already watched."
+  (when (and (featurep 'filenotify)
+             (not (gethash root vhdl-nav--watchers)))
+    (condition-case err
+        (let ((descs
+               (delq nil
+                     (mapcar
+                      (lambda (d)
+                        (when (file-directory-p d)
+                          (ignore-errors
+                            (file-notify-add-watch
+                             d '(change)
+                             (lambda (ev)
+                               (vhdl-nav--watcher-callback root ev))))))
+                      dirs))))
+          (when descs
+            (puthash root descs vhdl-nav--watchers)
+            (when vhdl-nav-debug
+              (message "vhdl-navigator: watching %d dir(s) under %s"
+                       (length descs) (abbreviate-file-name root)))))
+      (error
+       (when vhdl-nav-debug
+         (message "vhdl-navigator: filenotify setup failed: %s" err))))))
+
+(defun vhdl-nav--setup-watchers-from-index (root)
+  "Derive watched directories from the current mtimes table and start watchers."
+  (let ((mtimes  (gethash root vhdl-nav--file-mtimes))
+        (dir-set (make-hash-table :test 'equal)))
+    (puthash root t dir-set)
+    (when mtimes
+      (maphash (lambda (f _) (puthash (file-name-directory f) t dir-set)) mtimes))
+    (let ((dirs '()))
+      (maphash (lambda (d _) (push d dirs)) dir-set)
+      (vhdl-nav--watch-dirs root dirs))))
+
+(defun vhdl-nav--stop-watchers (root)
+  "Remove all filenotify watchers for project ROOT."
+  (dolist (d (gethash root vhdl-nav--watchers))
+    (condition-case _ (file-notify-rm-watch d) (error nil)))
+  (remhash root vhdl-nav--watchers))
+
+;; ---------------------------------------------------------------------------
+;; Deferred startup freshness check
+;; ---------------------------------------------------------------------------
+
+(defun vhdl-nav--deferred-startup-check (root)
+  "Update stale cache entries, running only when Emacs has been idle ≥ 2 s.
+This catches files modified between sessions without blocking startup.
+Because it runs after the cache is already active, features work
+immediately with the cached data while the refresh happens silently."
+  (if (null (current-idle-time))
+      ;; User became active before we ran — reschedule
+      (run-with-idle-timer 2.0 nil #'vhdl-nav--deferred-startup-check root)
+    (let* ((cached-mtimes (gethash root vhdl-nav--file-mtimes))
+           (diff    (when cached-mtimes (vhdl-nav--diff-files root cached-mtimes)))
+           (stale   (plist-get diff :stale))
+           (deleted (plist-get diff :deleted)))
+      ;; Purge deleted files — cheap hash-table operations
+      (dolist (f deleted)
+        (let ((index (gethash root vhdl-nav--project-indices)))
+          (when index (vhdl-nav--purge-file-from-index index f)))
+        (remhash f cached-mtimes))
+      ;; Async re-parse of changed/new files
+      (if stale
+          (progn
+            (message "vhdl-navigator: %d file(s) changed since last session, updating..."
+                     (length stale))
+            (vhdl-nav--build-index-async-files root stale))
+        (when vhdl-nav-debug
+          (message "vhdl-navigator: index is up to date")))
+      ;; Refresh watchers to cover any new directories
+      (when (or stale deleted)
+        (vhdl-nav--stop-watchers root)
+        (vhdl-nav--setup-watchers-from-index root)))))
+
+;; ---------------------------------------------------------------------------
 ;; Index management
 ;; ---------------------------------------------------------------------------
 
 (defun vhdl-nav--get-index (&optional force)
   "Get or build the VHDL index for the current project.
 When FORCE is non-nil, rebuild from scratch (ignoring cache)."
-  (let* ((root (vhdl-nav--project-root))
+  (let* ((root  (vhdl-nav--project-root))
          (index (gethash root vhdl-nav--project-indices)))
     (when (or force (not index))
       (if force
@@ -529,29 +673,25 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
             (vhdl-nav--async-cancel)
             (setq index (vhdl-nav--build-index-sync root))
             (puthash root index vhdl-nav--project-indices)
-            (vhdl-nav--save-cache root))
-        ;; First access: try loading cache, then update incrementally
+            (vhdl-nav--save-cache root)
+            (vhdl-nav--setup-watchers-from-index root))
+        ;; First access: try loading from persistent cache
         (let ((cached (vhdl-nav--load-cache root)))
           (if cached
-              (let* ((cached-index (car cached))
-                     (cached-mtimes (cdr cached))
-                     (diff (vhdl-nav--diff-files root cached-mtimes)))
-                ;; Install cached data
-                (puthash root cached-index vhdl-nav--project-indices)
+              (let ((cached-index  (car cached))
+                    (cached-mtimes (cdr cached)))
+                ;; Install cache immediately — zero scanning, zero blocking
+                (puthash root cached-index  vhdl-nav--project-indices)
                 (puthash root cached-mtimes vhdl-nav--file-mtimes)
                 (setq index cached-index)
-                ;; Remove defs from deleted files
-                (dolist (del (plist-get diff :deleted))
-                  (vhdl-nav--purge-file-from-index cached-index del)
-                  (remhash del cached-mtimes))
-                ;; Queue only stale (new/modified) files for re-parsing
-                (let ((stale (plist-get diff :stale)))
-                  (if stale
-                      (progn
-                        (message "vhdl-navigator: cache loaded, %d file(s) to update"
-                                 (length stale))
-                        (vhdl-nav--build-index-async-files root stale))
-                    (message "vhdl-navigator: cache loaded, index is up to date"))))
+                (message "vhdl-navigator: cache loaded for %s"
+                         (abbreviate-file-name root))
+                ;; Start watching dirs already known from cached mtimes
+                (vhdl-nav--setup-watchers-from-index root)
+                ;; Defer mtime freshness check to idle time — never blocks startup
+                (when vhdl-nav-startup-check
+                  (run-with-idle-timer
+                   2.0 nil #'vhdl-nav--deferred-startup-check root)))
             ;; No cache: empty index + full async build
             (setq index (make-hash-table :test 'equal))
             (puthash root index vhdl-nav--project-indices)
@@ -641,7 +781,8 @@ Stale files are purged from the index before re-parsing."
           (puthash root mtimes vhdl-nav--file-mtimes)
           (message "vhdl-navigator: updated %d definitions from %d files"
                    count (length files))
-          (vhdl-nav--save-cache root)))
+          (vhdl-nav--save-cache root)
+          (vhdl-nav--setup-watchers-from-index root)))
     ;; Ensure mtimes table exists
     (unless (gethash root vhdl-nav--file-mtimes)
       (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
@@ -678,7 +819,8 @@ Otherwise processes one batch and schedules the next."
         (let ((root vhdl-nav--async-root))
           (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
                    vhdl-nav--async-count vhdl-nav--async-total)
-          (vhdl-nav--save-cache root))
+          (vhdl-nav--save-cache root)
+          (vhdl-nav--setup-watchers-from-index root))
       ;; Parse a batch
       (let* ((root vhdl-nav--async-root)
              (index (gethash root vhdl-nav--project-indices))
@@ -1070,7 +1212,18 @@ Otherwise processes one batch and schedules the next."
     (remove-hook 'eldoc-documentation-functions
                  #'vhdl-nav-eldoc-function t)
     (remove-hook 'after-save-hook
-                 #'vhdl-nav--after-save-hook t)))
+                 #'vhdl-nav--after-save-hook t)
+    ;; Stop watchers only when no other vhdl-navigator buffer is open for this project
+    (let* ((root (vhdl-nav--project-root))
+           (still-active
+            (cl-some (lambda (b)
+                       (and (not (eq b (current-buffer)))
+                            (buffer-local-value 'vhdl-navigator-mode b)
+                            (with-current-buffer b
+                              (equal (vhdl-nav--project-root) root))))
+                     (buffer-list))))
+      (unless still-active
+        (vhdl-nav--stop-watchers root)))))
 
 ;;;###autoload
 (defun vhdl-navigator-setup ()
