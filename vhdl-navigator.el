@@ -509,29 +509,51 @@ Returns (index-hash . mtimes-hash) or nil if no valid cache."
 
 (defun vhdl-nav--diff-files (root cached-mtimes)
   "Compare files on disk with CACHED-MTIMES for project ROOT.
-Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
-  (let ((disk-files (vhdl-nav--find-vhdl-files root))
-        (stale '())
-        (seen (make-hash-table :test 'equal)))
-    ;; Find new or modified files
-    (dolist (f disk-files)
-      (puthash f t seen)
-      (let ((cached-mtime (gethash f cached-mtimes))
-            (current-mtime (ignore-errors
-                             (float-time
-                              (file-attribute-modification-time
-                               (file-attributes f))))))
-        (when (or (null cached-mtime)
-                  (null current-mtime)
-                  (/= cached-mtime current-mtime))
-          (push f stale))))
-    ;; Find deleted files (in cache but not on disk)
-    (let ((deleted '()))
-      (maphash (lambda (f _mtime)
-                 (unless (gethash f seen)
-                   (push f deleted)))
-               cached-mtimes)
-      (list :stale stale :deleted deleted))))
+Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE).
+
+This implementation never calls `directory-files-recursively'.  It stats
+only the files already present in CACHED-MTIMES (O(known-files) syscalls),
+then checks each known directory's own mtime to detect newly added VHDL
+files without scanning the whole tree (O(known-dirs) syscalls)."
+  (let ((stale '())
+        (deleted '())
+        (re (concat "\\." (regexp-opt vhdl-nav-file-extensions t) "\\'"))
+        ;; dir → newest cached mtime among files in that dir
+        (dir-max (make-hash-table :test 'equal)))
+    ;; Pass 1: check every file we already know; build dir-max in parallel.
+    (maphash
+     (lambda (f cached-mtime)
+       ;; Track newest cached mtime per directory for new-file detection.
+       (let ((dir (file-name-directory f)))
+         (puthash dir (max (or (gethash dir dir-max) 0.0) cached-mtime)
+                  dir-max))
+       (let* ((attrs (ignore-errors (file-attributes f)))
+              (cur   (when attrs
+                       (ignore-errors
+                         (float-time
+                          (file-attribute-modification-time attrs))))))
+         (cond
+          ((null attrs)                          (push f deleted))
+          ((or (null cur) (/= cur cached-mtime)) (push f stale)))))
+     cached-mtimes)
+    ;; Pass 2: detect new VHDL files in known directories.
+    ;; A directory's mtime is updated whenever a file is created or deleted
+    ;; inside it.  If the directory is newer than every cached file it
+    ;; contained, something was added — scan it (non-recursively).
+    (maphash
+     (lambda (dir max-cached)
+       (when (file-directory-p dir)
+         (let* ((da (ignore-errors (file-attributes dir)))
+                (dm (when da
+                      (ignore-errors
+                        (float-time
+                         (file-attribute-modification-time da))))))
+           (when (and dm (> dm max-cached))
+             (dolist (f (ignore-errors (directory-files dir t re)))
+               (unless (gethash f cached-mtimes)
+                 (push f stale)))))))
+     dir-max)
+    (list :stale stale :deleted deleted)))
 
 ;; ---------------------------------------------------------------------------
 ;; File-system watcher (filenotify)
