@@ -750,16 +750,17 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
 
 (defun vhdl-nav--purge-file-from-index (index filepath)
   "Remove all defs belonging to FILEPATH from INDEX hash-table."
-  (maphash (lambda (key defs)
-             (let ((filtered (seq-remove
-                              (lambda (d)
-                                (and (vhdl-nav-def-p d)
-                                     (string= (vhdl-nav-def-file d) filepath)))
-                              defs)))
-               (if filtered
-                   (puthash key filtered index)
-                 (remhash key index))))
-           index))
+  (when index
+    (maphash (lambda (key defs)
+               (let ((filtered (seq-remove
+                                (lambda (d)
+                                  (and (vhdl-nav-def-p d)
+                                       (string= (vhdl-nav-def-file d) filepath)))
+                                defs)))
+                 (if filtered
+                     (puthash key filtered index)
+                   (remhash key index))))
+             index)))
 
 (defun vhdl-nav--index-file-into (index mtimes filepath)
   "Parse FILEPATH and merge its defs into INDEX, updating MTIMES.
@@ -876,39 +877,47 @@ detect this and defer until the next idle period."
 If the user is actively typing, defers until they are idle for 0.5s.
 Otherwise processes one batch and schedules the next."
   (setq vhdl-nav--async-timer nil)
-  ;; If user is active, wait until they are idle
-  (if (null (current-idle-time))
-      (setq vhdl-nav--async-timer
-            (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))
-    ;; User is idle — do work
-    (if (null vhdl-nav--async-queue)
-        ;; Done — save cache and clean up
-        (let ((root vhdl-nav--async-root))
-          (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
-                   vhdl-nav--async-count vhdl-nav--async-total)
-          (vhdl-nav--save-cache root)
-          (vhdl-nav--setup-watchers-from-index root))
-      ;; Parse a batch
-      (let* ((root vhdl-nav--async-root)
-             (index (gethash root vhdl-nav--project-indices))
-             (mtimes (gethash root vhdl-nav--file-mtimes))
-             (batch-size vhdl-nav-index-batch-size)
-             (processed 0))
-        (while (and vhdl-nav--async-queue (< processed batch-size))
-          (let ((f (pop vhdl-nav--async-queue)))
-            ;; Purge old defs for this file before re-parsing
-            (vhdl-nav--purge-file-from-index index f)
-            (setq vhdl-nav--async-count
-                  (+ vhdl-nav--async-count
-                     (vhdl-nav--index-file-into index mtimes f))))
-          (setq processed (1+ processed)))
-        ;; Progress message
-        (let ((remaining (length vhdl-nav--async-queue)))
-          (when (> remaining 0)
-            (message "vhdl-navigator: indexing... %d/%d files remaining"
-                     remaining vhdl-nav--async-total)))
-        ;; Schedule next batch
-        (vhdl-nav--async-schedule-next)))))
+  (condition-case err
+      (if (null (current-idle-time))
+          ;; User is active — defer until idle
+          (setq vhdl-nav--async-timer
+                (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))
+        ;; User is idle — do work
+        (if (null vhdl-nav--async-queue)
+            ;; Done — save cache and set up watchers
+            (let ((root vhdl-nav--async-root))
+              (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
+                       vhdl-nav--async-count vhdl-nav--async-total)
+              (vhdl-nav--save-cache root)
+              (vhdl-nav--setup-watchers-from-index root))
+          ;; Parse a batch
+          (let* ((root       vhdl-nav--async-root)
+                 (index      (gethash root vhdl-nav--project-indices))
+                 (mtimes     (gethash root vhdl-nav--file-mtimes))
+                 (batch-size vhdl-nav-index-batch-size)
+                 (processed  0))
+            (if (or (null index) (null mtimes))
+                ;; Index was evicted (shouldn't happen, but be safe)
+                (progn
+                  (message "vhdl-navigator: index unavailable, cancelling async run for %s"
+                           (abbreviate-file-name (or root "")))
+                  (vhdl-nav--async-cancel))
+              (while (and vhdl-nav--async-queue (< processed batch-size))
+                (let ((f (pop vhdl-nav--async-queue)))
+                  (vhdl-nav--purge-file-from-index index f)
+                  (setq vhdl-nav--async-count
+                        (+ vhdl-nav--async-count
+                           (vhdl-nav--index-file-into index mtimes f))))
+                (setq processed (1+ processed)))
+              ;; Progress message
+              (let ((remaining (length vhdl-nav--async-queue)))
+                (when (> remaining 0)
+                  (message "vhdl-navigator: indexing... %d/%d files remaining"
+                           remaining vhdl-nav--async-total)))
+              ;; Schedule next batch
+              (vhdl-nav--async-schedule-next)))))
+    (error
+     (message "vhdl-navigator: error in async batch: %s" err))))
 
 (defun vhdl-nav--reindex-file (filepath)
   "Re-index a single FILEPATH and merge into the project index."
