@@ -27,6 +27,7 @@
 (require 'xref)
 (require 'project)
 (require 'seq)
+(require 'subr-x)
 
 ;; ---------------------------------------------------------------------------
 ;; Customization
@@ -77,12 +78,27 @@ Set to nil to disable persistent caching."
 The check runs asynchronously after the cache is already loaded and
 active, so Emacs never blocks.  Set to nil to skip it entirely and
 rely solely on file-notification events and `after-save-hook' for
-index updates — useful on network-mounted file-systems where even an
+index updates - useful on network-mounted file-systems where even an
 idle-time scan is undesirably slow."
   :type 'boolean
   :group 'vhdl-navigator)
 
 ;; ---------------------------------------------------------------------------
+
+(defcustom vhdl-nav-folders-file ".vhdl-nav-folders"
+  "File name in project root containing folders to index.
+Each line should contain a folder path relative to project root.
+Only these folders and their subdirectories will be scanned for VHDL files.
+If the file does not exist, the entire project is scanned."
+  :type 'string
+  :group 'vhdl-navigator)
+
+(defcustom vhdl-nav-ignore-file ".vhdl-nav-ignore"
+  "File name in project root with glob patterns to exclude from indexing.
+Each line should contain a pattern (for example, \"build/*\" or \"*.cache\").
+Lines starting with ';' or '#' are treated as comments."
+  :type 'string
+  :group 'vhdl-navigator)
 ;; Internal data structures
 ;; ---------------------------------------------------------------------------
 
@@ -130,7 +146,7 @@ idle-time scan is undesirably slow."
   "Map from project root to per-project debounce timer for file events.")
 
 (defvar vhdl-nav--watcher-queue (make-hash-table :test 'equal)
-  "Map from project root to hash of file→action pairs pending processing.")
+  "Map from project root to hash of file/action pairs pending processing.")
 
 ;; ---------------------------------------------------------------------------
 ;; Project root detection
@@ -147,14 +163,64 @@ idle-time scan is undesirably slow."
       default-directory))
 
 ;; ---------------------------------------------------------------------------
+;; Folder filtering
+;; ---------------------------------------------------------------------------
+
+(defun vhdl-nav--read-config-lines (file)
+  "Return non-empty, non-comment lines from FILE."
+  (when (and (file-exists-p file)
+             (file-regular-p file)
+             (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (let (lines)
+        (while (not (eobp))
+          (let ((line (string-trim (buffer-substring-no-properties
+                                    (point) (line-end-position)))))
+            (unless (or (string-empty-p line)
+                        (string-prefix-p ";" line)
+                        (string-prefix-p "#" line))
+              (push line lines)))
+          (forward-line))
+        (nreverse lines)))))
+
+(defun vhdl-nav--search-roots (project-root)
+  "Return absolute directories to scan for PROJECT-ROOT."
+  (let ((folders-file (expand-file-name vhdl-nav-folders-file project-root)))
+    (if (file-exists-p folders-file)
+        (delq nil
+              (mapcar (lambda (folder)
+                        (let ((abs-path (expand-file-name folder project-root)))
+                          (when (file-directory-p abs-path)
+                            (file-name-as-directory abs-path))))
+                      (vhdl-nav--read-config-lines folders-file)))
+      (list project-root))))
+
+(defun vhdl-nav--should-ignore-p (project-root file)
+  "Return non-nil if FILE should be ignored for PROJECT-ROOT."
+  (when vhdl-nav-ignore-file
+    (let* ((ignore-file (expand-file-name vhdl-nav-ignore-file project-root))
+           (relative-file (file-relative-name file project-root))
+           (patterns (vhdl-nav--read-config-lines ignore-file)))
+      (cl-some (lambda (pattern)
+                 (or (string-match-p (wildcard-to-regexp pattern) relative-file)
+                     (string-match-p (wildcard-to-regexp pattern) file)))
+               patterns))))
+
+;; ---------------------------------------------------------------------------
 ;; File discovery
 ;; ---------------------------------------------------------------------------
 
 (defun vhdl-nav--find-vhdl-files (root)
-  "Find all VHDL files under ROOT."
+  "Find all VHDL files under ROOT or specified subfolders."
   (when (and root (stringp root) (file-directory-p root))
-    (let ((re (concat "\\." (regexp-opt vhdl-nav-file-extensions) "\\'")))
-      (directory-files-recursively root re nil))))
+    (let* ((re (concat "\\." (regexp-opt vhdl-nav-file-extensions) "\\'"))
+           (search-roots (vhdl-nav--search-roots root))
+           (all-files nil))
+      (dolist (search-root search-roots all-files)
+        (let ((files (directory-files-recursively search-root re nil)))
+          (setq all-files (append all-files files))))
+      (seq-filter (lambda (f) (not (vhdl-nav--should-ignore-p root f))) all-files))))
 
 ;; ---------------------------------------------------------------------------
 ;; VHDL Parsing -- plain regex strings, NO rx macros
@@ -457,7 +523,7 @@ Never signals -- returns nil on any fatal error."
             (when (and index mtimes)
               (unless (file-directory-p vhdl-nav-cache-directory)
                 (make-directory vhdl-nav-cache-directory t))
-              ;; Convert index hash → alist of (name . list-of-defs)
+              ;; Convert index hash to alist of (name . list-of-defs)
               (let ((index-alist '())
                     (mtimes-alist '()))
                 (maphash (lambda (k v) (push (cons k v) index-alist)) index)
@@ -552,8 +618,18 @@ Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
         (pcase action
           ('deleted (puthash file  'deleted queue))
           ('renamed (puthash file  'deleted queue)
-                    (when file2 (puthash file2 'changed queue)))
-          (_        (puthash file  'changed queue))))
+                    (when file2
+                      (puthash file2
+                               (if (vhdl-nav--should-ignore-p root file2)
+                                   'deleted
+                                 'changed)
+                               queue)))
+          (_        (when file
+                      (puthash file
+                               (if (vhdl-nav--should-ignore-p root file)
+                                   'deleted
+                                 'changed)
+                               queue)))))
       ;; Per-project debounce: accumulate events then flush after 1 s of quiet
       (let ((existing (gethash root vhdl-nav--watcher-debounces)))
         (when existing (cancel-timer existing)))
@@ -568,14 +644,14 @@ Returns a plist (:stale FILES-TO-REPARSE :deleted FILES-TO-REMOVE)."
          (index  (gethash root vhdl-nav--project-indices))
          (mtimes (gethash root vhdl-nav--file-mtimes)))
     (cond
-     ;; Nothing queued — nothing to do
+     ;; Nothing queued - nothing to do
      ((null queue))
-     ;; Index not yet loaded — reschedule so events are not lost
+     ;; Index not yet loaded - reschedule so events are not lost
      ((or (null index) (null mtimes))
       (puthash root
                (run-with-idle-timer 2.0 nil #'vhdl-nav--flush-watcher-queue root)
                vhdl-nav--watcher-debounces))
-     ;; Index ready — process the queue
+     ;; Index ready - process the queue
      (t
       (let ((reparse '())
             (purge '()))
@@ -637,18 +713,18 @@ Silently does nothing if filenotify is unavailable or ROOT is already watched."
 ;; ---------------------------------------------------------------------------
 
 (defun vhdl-nav--deferred-startup-check (root)
-  "Update stale cache entries, running only when Emacs has been idle ≥ 2 s.
+  "Update stale cache entries, running only when Emacs has been idle for 2s.
 This catches files modified between sessions without blocking startup.
 Because it runs after the cache is already active, features work
 immediately with the cached data while the refresh happens silently."
   (if (null (current-idle-time))
-      ;; User became active before we ran — reschedule
+      ;; User became active before we ran - reschedule
       (run-with-idle-timer 2.0 nil #'vhdl-nav--deferred-startup-check root)
     (let* ((cached-mtimes (gethash root vhdl-nav--file-mtimes))
            (diff    (when cached-mtimes (vhdl-nav--diff-files root cached-mtimes)))
            (stale   (plist-get diff :stale))
            (deleted (plist-get diff :deleted)))
-      ;; Purge deleted files — cheap hash-table operations
+      ;; Purge deleted files - cheap hash-table operations
       (dolist (f deleted)
         (let ((index (gethash root vhdl-nav--project-indices)))
           (when index (vhdl-nav--purge-file-from-index index f)))
@@ -689,7 +765,7 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
           (if cached
               (let ((cached-index  (car cached))
                     (cached-mtimes (cdr cached)))
-                ;; Install cache immediately — zero scanning, zero blocking
+                ;; Install cache immediately - zero scanning, zero blocking
                 (puthash root cached-index  vhdl-nav--project-indices)
                 (puthash root cached-mtimes vhdl-nav--file-mtimes)
                 (setq index cached-index)
@@ -697,7 +773,7 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
                          (abbreviate-file-name root))
                 ;; Start watching dirs already known from cached mtimes
                 (vhdl-nav--setup-watchers-from-index root)
-                ;; Defer mtime freshness check to idle time — never blocks startup
+                ;; Defer mtime freshness check to idle time - never blocks startup
                 (when vhdl-nav-startup-check
                   (run-with-idle-timer
                    2.0 nil #'vhdl-nav--deferred-startup-check root)))
@@ -796,7 +872,7 @@ into the existing queue rather than cancelling the ongoing work."
           (vhdl-nav--setup-watchers-from-index root)))
     ;; Async path
     (if (and (equal vhdl-nav--async-root root) vhdl-nav--async-queue)
-        ;; Same project already indexing — merge new files in to avoid
+        ;; Same project already indexing - merge new files in to avoid
         ;; cancelling in-progress work.  Prepend so recent changes are
         ;; picked up in the next batch.
         (let ((new-files (seq-remove
@@ -809,7 +885,7 @@ into the existing queue rather than cancelling the ongoing work."
           (unless vhdl-nav--async-timer
             (setq vhdl-nav--async-timer
                   (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))))
-      ;; Different project or idle queue — start fresh
+      ;; Different project or idle queue - start fresh
       (vhdl-nav--async-cancel)
       (unless (gethash root vhdl-nav--file-mtimes)
         (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
@@ -839,11 +915,11 @@ Otherwise processes one batch and schedules the next."
   (if (null (current-idle-time))
       (setq vhdl-nav--async-timer
             (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))
-    ;; User is idle — do work
+    ;; User is idle - do work
     (if (null vhdl-nav--async-queue)
-        ;; Done — save cache and clean up
+        ;; Done - save cache and clean up
         (let ((root vhdl-nav--async-root))
-          (message "vhdl-navigator: async indexing complete — %d definitions from %d file(s)"
+          (message "vhdl-navigator: async indexing complete - %d definitions from %d file(s)"
                    vhdl-nav--async-count vhdl-nav--async-total)
           (vhdl-nav--save-cache root)
           (vhdl-nav--setup-watchers-from-index root))
@@ -879,7 +955,9 @@ Otherwise processes one batch and schedules the next."
                        ht))))
     (when index
       (vhdl-nav--purge-file-from-index index filepath)
-      (vhdl-nav--index-file-into index mtimes filepath)
+      (if (vhdl-nav--should-ignore-p root filepath)
+          (remhash filepath mtimes)
+        (vhdl-nav--index-file-into index mtimes filepath))
       (vhdl-nav--save-cache root))))
 
 (defun vhdl-nav--after-save-hook ()
@@ -1211,7 +1289,7 @@ Otherwise processes one batch and schedules the next."
   "Trigger field completion immediately after '.' is typed.
 Most completion frontends (Corfu, Company) only auto-trigger after word
 characters, so they miss the dot.  This hook calls `completion-at-point'
-right after insertion — but only when the dot follows an identifier that
+right after insertion - but only when the dot follows an identifier that
 we can resolve, and only outside comments and string literals."
   (when (and (eq last-command-event ?.)
              (let ((ppss (syntax-ppss)))

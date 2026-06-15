@@ -10,6 +10,7 @@ Designed for Gaisler two-process style where records are pervasive.
 - **Go-to-definition** (`gd` / `M-.`) — jumps to the source of records, entities, architectures, signals, constants, variables, functions, procedures, and packages
 - **Eldoc** — automatic minibuffer display of field types when cursor is after `.`
 - **Project-wide indexing** — scans multi-level `src/` hierarchies, caches per-project, auto-reindexes on save
+- **Project scan filtering** — optional `.vhdl-nav-folders` and `.vhdl-nav-ignore` files limit which VHDL files are indexed
 
 ## Installation
 
@@ -124,6 +125,36 @@ The cache is stored under `~/.emacs.d/vhdl-navigator/` (one file per project,
 named by MD5 of the project root). Set `vhdl-nav-cache-directory` to nil to
 disable persistence.
 
+## Project Scan Filtering
+
+By default, `vhdl-navigator` scans all VHDL files under the detected project
+root. Large repositories can opt into narrower indexing with project-local
+configuration files.
+
+Create `.vhdl-nav-folders` in the project root to scan only specific folders:
+
+```text
+rtl
+ip/common
+sim/packages
+```
+
+Each entry is relative to the project root. If `.vhdl-nav-folders` does not
+exist, the whole project is scanned. Blank lines and lines starting with `#` or
+`;` are ignored.
+
+Create `.vhdl-nav-ignore` in the project root to exclude files from indexing:
+
+```text
+build/*
+generated/*
+*.cache
+```
+
+Patterns are shell-style globs matched against project-relative paths. The same
+ignore rules are applied during full indexing, deferred cache refresh, file
+notification updates, and after-save reindexing.
+
 ## Configuration
 
 | Variable                          | Default                            | Description                                                       |
@@ -134,6 +165,8 @@ disable persistence.
 | `vhdl-nav-index-batch-size`        | `20`                               | Files parsed per idle cycle (0 = sync/blocking)                   |
 | `vhdl-nav-cache-directory`         | `~/.emacs.d/vhdl-navigator/`      | Cache directory (nil = no persistence)                            |
 | `vhdl-nav-startup-check`           | `t`                                | Check for between-session changes during idle time at startup     |
+| `vhdl-nav-folders-file`            | `.vhdl-nav-folders`                | Project file listing folders to index                             |
+| `vhdl-nav-ignore-file`             | `.vhdl-nav-ignore`                 | Project file listing glob patterns to exclude                     |
 | `vhdl-nav-debug`                   | `nil`                              | Log parse details to `*Messages*`                                 |
 
 Example tuning in `config.el`:
