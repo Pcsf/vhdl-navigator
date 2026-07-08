@@ -1,7 +1,7 @@
 ;;; vhdl-navigator.el --- VHDL record visualizer & go-to-definition -*- lexical-binding: t; -*-
 
 ;; Author: Paulo (generated with Claude)
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "28.1") (project "0.9"))
 ;; Keywords: languages, vhdl, navigation, completion
 ;; URL: https://github.com/your-user/vhdl-navigator
@@ -28,6 +28,10 @@
 (require 'project)
 (require 'seq)
 (require 'subr-x)
+
+(defconst vhdl-nav--library-file (or load-file-name buffer-file-name)
+  "Location of this library, captured at load time.
+Worker subprocesses load this exact file so they run the same parser.")
 
 ;; ---------------------------------------------------------------------------
 ;; Customization
@@ -81,6 +85,22 @@ rely solely on file-notification events and `after-save-hook' for
 index updates - useful on network-mounted file-systems where even an
 idle-time scan is undesirably slow."
   :type 'boolean
+  :group 'vhdl-navigator)
+
+(defcustom vhdl-nav-worker-count 0
+  "Number of `emacs --batch' subprocesses used for project indexing.
+0 means auto: one per CPU core (capped at 8), leaving one core for the
+interactive Emacs.  A negative value or nil disables subprocess
+indexing entirely; the slower in-process idle-timer indexer is used
+instead."
+  :type '(choice integer (const :tag "Disabled" nil))
+  :group 'vhdl-navigator)
+
+(defcustom vhdl-nav-worker-min-files 10
+  "Minimum number of files before worker subprocesses are used.
+Smaller updates (single saves, watcher events) are parsed in-process,
+which is faster than paying the subprocess startup cost."
+  :type 'integer
   :group 'vhdl-navigator)
 
 ;; ---------------------------------------------------------------------------
@@ -753,13 +773,21 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
          (index (gethash root vhdl-nav--project-indices)))
     (when (or force (not index))
       (if force
-          ;; Forced: synchronous full rebuild, then save cache
+          ;; Forced: full rebuild from scratch.  Prefer worker subprocesses
+          ;; (non-blocking); fall back to the synchronous rebuild.
           (progn
             (vhdl-nav--async-cancel)
-            (setq index (vhdl-nav--build-index-sync root))
+            (setq index (make-hash-table :test 'equal))
             (puthash root index vhdl-nav--project-indices)
-            (vhdl-nav--save-cache root)
-            (vhdl-nav--setup-watchers-from-index root))
+            (puthash root (make-hash-table :test 'equal)
+                     vhdl-nav--file-mtimes)
+            (unless (and (vhdl-nav--parallel-available-p root)
+                         (vhdl-nav--build-index-parallel
+                          root nil (vhdl-nav--priority-dir)))
+              (setq index (vhdl-nav--build-index-sync root))
+              (puthash root index vhdl-nav--project-indices)
+              (vhdl-nav--save-cache root)
+              (vhdl-nav--setup-watchers-from-index root)))
         ;; First access: try loading from persistent cache
         (let ((cached (vhdl-nav--load-cache root)))
           (if cached
@@ -777,11 +805,28 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
                 (when vhdl-nav-startup-check
                   (run-with-idle-timer
                    2.0 nil #'vhdl-nav--deferred-startup-check root)))
-            ;; No cache: empty index + full async build
+            ;; No cache: empty index + warm start + full async build
             (setq index (make-hash-table :test 'equal))
             (puthash root index vhdl-nav--project-indices)
+            (unless (gethash root vhdl-nav--file-mtimes)
+              (puthash root (make-hash-table :test 'equal)
+                       vhdl-nav--file-mtimes))
+            ;; Warm start: parse the visited file synchronously (a single
+            ;; file - milliseconds) so completion, Eldoc, and xref work
+            ;; immediately while the project-wide scan runs in the background.
+            (when-let ((file (vhdl-nav--current-vhdl-file)))
+              (vhdl-nav--index-file-into
+               index (gethash root vhdl-nav--file-mtimes) file))
             (vhdl-nav--build-index-async root)))))
     index))
+
+(defun vhdl-nav--purge-if-indexed (index mtimes filepath)
+  "Purge FILEPATH from INDEX only when it was indexed before.
+MTIMES records every indexed file, so absence means there is nothing to
+purge - crucial on first-time builds, where purging every incoming file
+would scan the whole index each time (O(n^2))."
+  (when (and index mtimes (gethash filepath mtimes))
+    (vhdl-nav--purge-file-from-index index filepath)))
 
 (defun vhdl-nav--purge-file-from-index (index filepath)
   "Remove all defs belonging to FILEPATH from INDEX hash-table."
@@ -796,29 +841,364 @@ When FORCE is non-nil, rebuild from scratch (ignoring cache)."
                  (remhash key index))))
            index))
 
+(defun vhdl-nav--merge-defs (index defs)
+  "Merge the list DEFS into INDEX.  Return the number of defs added."
+  (let ((count 0))
+    (dolist (d defs)
+      (when (and (vhdl-nav-def-p d)
+                 (stringp (vhdl-nav-def-name d)))
+        (let* ((name (vhdl-nav-def-name d))
+               (existing (gethash name index)))
+          (puthash name (cons d existing) index))
+        (setq count (1+ count))))
+    count))
+
 (defun vhdl-nav--index-file-into (index mtimes filepath)
   "Parse FILEPATH and merge its defs into INDEX, updating MTIMES.
 Returns the number of defs added."
   (condition-case err
-      (let ((defs (vhdl-nav--parse-file filepath))
-            (count 0))
-        (when (listp defs)
+      (let ((defs (vhdl-nav--parse-file filepath)))
+        (if (not (listp defs))
+            0
           (ignore-errors
             (puthash filepath (float-time
                                (file-attribute-modification-time
                                 (file-attributes filepath)))
                      mtimes))
-          (dolist (d defs)
-            (when (and (vhdl-nav-def-p d)
-                       (stringp (vhdl-nav-def-name d)))
-              (let* ((name (vhdl-nav-def-name d))
-                     (existing (gethash name index)))
-                (puthash name (cons d existing) index))
-              (setq count (1+ count)))))
-        count)
+          (vhdl-nav--merge-defs index defs)))
     (error
      (message "vhdl-navigator: error on %s: %s" filepath err)
      0)))
+
+;; ---------------------------------------------------------------------------
+;; Parallel subprocess indexing
+;; ---------------------------------------------------------------------------
+;;
+;; Emacs Lisp is single-threaded, so large first-time scans are offloaded to
+;; `emacs --batch' worker subprocesses.  Each worker loads this very library,
+;; reuses `vhdl-nav--parse-file', and streams printed result forms back on
+;; stdout, where the parent merges them into the index (cheap hash-table work
+;; only).  Workers run fully parallel on Linux and Windows with no dependency
+;; beyond the Emacs binary itself.
+;;
+;; Protocol: the parent writes a job plist to a temp file (avoids Windows
+;; command-line length limits and all shell quoting) and spawns
+;;   emacs -Q --batch -l vhdl-navigator.el -f vhdl-nav--worker-main JOB-FILE
+;; A discovery job (:discover t) answers with one (:files (...)) form; a
+;; parse job (:files ...) answers with one (:file F :mtime M :defs (...))
+;; form per file.  Structs print as #s(...), the same readable format the
+;; persistent cache uses.
+
+(cl-defstruct (vhdl-nav--run (:constructor vhdl-nav--run-create))
+  "State of one parallel indexing run."
+  root          ; project root
+  procs         ; live worker process objects
+  files         ; full ordered file list (once known)
+  total         ; total files to parse (0 until discovery completes)
+  done          ; files merged so far
+  dispatched    ; non-nil once parse workers have been spawned
+  start-time    ; for the completion message
+  last-progress ; float-time of last progress message (throttle)
+  priority-dir) ; directory whose files are parsed first, or nil
+
+(defvar vhdl-nav--parallel-run nil
+  "Current `vhdl-nav--run' struct, or nil when no workers are active.")
+
+(defun vhdl-nav--effective-worker-count ()
+  "Number of worker subprocesses to use, honoring `vhdl-nav-worker-count'."
+  (cond ((or (null vhdl-nav-worker-count) (< vhdl-nav-worker-count 0)) 0)
+        ((= vhdl-nav-worker-count 0) (max 1 (min 8 (1- (num-processors)))))
+        (t vhdl-nav-worker-count)))
+
+(defun vhdl-nav--emacs-binary ()
+  "Path of the Emacs executable to use for worker subprocesses."
+  (let ((exe (expand-file-name invocation-name invocation-directory)))
+    (if (file-executable-p exe) exe (executable-find "emacs"))))
+
+(defun vhdl-nav--library ()
+  "Path of this library, for workers to load."
+  (or vhdl-nav--library-file (locate-library "vhdl-navigator")))
+
+(defun vhdl-nav--parallel-available-p (root)
+  "Return non-nil when subprocess indexing can be used for ROOT."
+  (and (> (vhdl-nav--effective-worker-count) 0)
+       (stringp root)
+       (not (file-remote-p root))
+       (vhdl-nav--library)
+       (vhdl-nav--emacs-binary)))
+
+(defun vhdl-nav--current-vhdl-file ()
+  "Return function `buffer-file-name' when visiting a VHDL file, else nil."
+  (when (and buffer-file-name
+             (let ((ext (file-name-extension buffer-file-name)))
+               (and ext (member (downcase ext) vhdl-nav-file-extensions))))
+    buffer-file-name))
+
+(defun vhdl-nav--priority-dir ()
+  "Directory of the current VHDL buffer, to be indexed first, or nil."
+  (when-let ((f (vhdl-nav--current-vhdl-file)))
+    (file-name-directory (expand-file-name f))))
+
+(defun vhdl-nav--order-files (files priority-dir)
+  "Return FILES with the ones under PRIORITY-DIR first."
+  (if (not priority-dir)
+      files
+    (nconc (seq-filter (lambda (f) (string-prefix-p priority-dir f)) files)
+           (seq-remove (lambda (f) (string-prefix-p priority-dir f)) files))))
+
+(defun vhdl-nav--chunk-list (list n)
+  "Split LIST into at most N contiguous chunks of nearly equal size."
+  (let* ((size (max 1 (ceiling (length list) (max 1 n))))
+         (chunks '()))
+    (while list
+      (push (seq-take list size) chunks)
+      (setq list (nthcdr size list)))
+    (nreverse chunks)))
+
+(defun vhdl-nav--job-config (root)
+  "Configuration plist shared by all worker jobs for ROOT."
+  (list :root root
+        :extensions vhdl-nav-file-extensions
+        :folders-file vhdl-nav-folders-file
+        :ignore-file vhdl-nav-ignore-file))
+
+(defun vhdl-nav--write-job-file (job)
+  "Write the JOB plist to a temp file and return its path."
+  (let ((file (make-temp-file "vhdl-nav-job-" nil ".el"))
+        (coding-system-for-write 'utf-8-unix)
+        (print-level nil)
+        (print-length nil))
+    (with-temp-file file (prin1 job (current-buffer)))
+    file))
+
+(defun vhdl-nav--worker-main ()
+  "Batch-mode entry point for indexing worker subprocesses.
+Reads a job plist from the file named on the command line and prints
+result forms on stdout for the parent Emacs to `read'."
+  (let* ((job-file (car command-line-args-left))
+         (job (let ((coding-system-for-read 'utf-8))
+                (with-temp-buffer
+                  (insert-file-contents job-file)
+                  (read (current-buffer)))))
+         (vhdl-nav-file-extensions (or (plist-get job :extensions)
+                                       vhdl-nav-file-extensions))
+         (vhdl-nav-folders-file (or (plist-get job :folders-file)
+                                    vhdl-nav-folders-file))
+         (vhdl-nav-ignore-file (or (plist-get job :ignore-file)
+                                   vhdl-nav-ignore-file))
+         (vhdl-nav-debug nil)
+         (print-level nil)
+         (print-length nil)
+         (locale-coding-system 'utf-8))
+    (setq command-line-args-left nil)
+    (if (plist-get job :discover)
+        (prin1 (list :files (vhdl-nav--find-vhdl-files (plist-get job :root))))
+      (dolist (f (plist-get job :files))
+        (prin1 (list :file f
+                     :mtime (ignore-errors
+                              (float-time
+                               (file-attribute-modification-time
+                                (file-attributes f))))
+                     :defs (vhdl-nav--parse-file f)))
+        (terpri)))
+    (terpri)))
+
+(defun vhdl-nav--spawn-worker (run job files kind)
+  "Spawn one KIND worker subprocess for RUN, handing it the JOB plist.
+FILES is the chunk this worker parses (nil for discovery).  Signals on
+spawn failure so callers can fall back."
+  (let* ((job-file (vhdl-nav--write-job-file job))
+         (default-directory (vhdl-nav--run-root run))
+         (errbuf (get-buffer-create " *vhdl-nav-worker-log*"))
+         (proc (make-process
+                :name (format "vhdl-nav-%s" kind)
+                :command (list (vhdl-nav--emacs-binary) "-Q" "--batch"
+                               "-l" (vhdl-nav--library)
+                               "-f" "vhdl-nav--worker-main" job-file)
+                :connection-type 'pipe
+                :coding '(utf-8 . utf-8)
+                :noquery t
+                :stderr errbuf
+                :filter #'vhdl-nav--worker-filter
+                :sentinel #'vhdl-nav--worker-sentinel)))
+    (when-let ((ep (get-buffer-process errbuf)))
+      (set-process-query-on-exit-flag ep nil))
+    (process-put proc 'vhdl-nav-run run)
+    (process-put proc 'vhdl-nav-files files)
+    (process-put proc 'vhdl-nav-job-file job-file)
+    (push proc (vhdl-nav--run-procs run))
+    proc))
+
+(defun vhdl-nav--worker-filter (proc output)
+  "Accumulate worker OUTPUT for PROC and merge complete printed forms.
+Output is buffered in a hidden per-process buffer; forms are only read
+once their terminating newline has arrived, so a large form split
+across many pipe chunks is parsed exactly once.  Any read error is
+treated as \"form still incomplete\" - a worker that truly produced
+garbage simply never completes its forms, and the sentinel re-queues
+its unreported files."
+  (let ((buf (process-get proc 'vhdl-nav-buf)))
+    (unless (buffer-live-p buf)
+      (setq buf (generate-new-buffer " *vhdl-nav-worker-out*"))
+      (process-put proc 'vhdl-nav-buf buf))
+    (with-current-buffer buf
+      (goto-char (point-max))
+      (insert output)
+      ;; Each form is followed by a newline; don't even attempt a read
+      ;; until one shows up.
+      (when (string-match-p "\n" output)
+        (let ((read-pos (point-min))
+              (done nil))
+          (goto-char read-pos)
+          (while (not done)
+            (condition-case nil
+                (let ((form (read buf)))
+                  (setq read-pos (point))
+                  (vhdl-nav--worker-handle-form proc form))
+              (error (setq done t))))
+          ;; Drop consumed text so the buffer stays small.
+          (delete-region (point-min) read-pos))))))
+
+(defun vhdl-nav--worker-handle-form (proc form)
+  "Dispatch one FORM read from worker PROC."
+  (let ((run (process-get proc 'vhdl-nav-run)))
+    (when (and (listp form)
+               (vhdl-nav--run-p run)
+               (eq run vhdl-nav--parallel-run))
+      (cond
+       ((plist-member form :file)
+        (vhdl-nav--parallel-merge-file run proc form))
+       ((plist-member form :files)
+        (vhdl-nav--parallel-dispatch run (plist-get form :files)))))))
+
+(defun vhdl-nav--parallel-merge-file (run proc form)
+  "Merge one parsed-file FORM from PROC into RUN's project index."
+  (let* ((root (vhdl-nav--run-root run))
+         (index (gethash root vhdl-nav--project-indices))
+         (mtimes (gethash root vhdl-nav--file-mtimes))
+         (file (plist-get form :file))
+         (mtime (plist-get form :mtime))
+         (defs (plist-get form :defs)))
+    (when (and index mtimes (stringp file))
+      (vhdl-nav--purge-if-indexed index mtimes file)
+      (when (numberp mtime) (puthash file mtime mtimes))
+      (vhdl-nav--merge-defs index defs)
+      (process-put proc 'vhdl-nav-files
+                   (delete file (process-get proc 'vhdl-nav-files)))
+      (cl-incf (vhdl-nav--run-done run))
+      (let ((now (float-time)))
+        (when (> (- now (vhdl-nav--run-last-progress run)) 1.0)
+          (setf (vhdl-nav--run-last-progress run) now)
+          (message "vhdl-navigator: indexing... %d/%d files"
+                   (vhdl-nav--run-done run) (vhdl-nav--run-total run)))))))
+
+(defun vhdl-nav--parallel-dispatch (run files)
+  "Order FILES, set totals, and spawn the parse workers for RUN.
+Signals on spawn failure; callers handle the fallback."
+  (let* ((root (vhdl-nav--run-root run))
+         (files (vhdl-nav--order-files files (vhdl-nav--run-priority-dir run))))
+    (setf (vhdl-nav--run-files run) files
+          (vhdl-nav--run-total run) (length files))
+    (if (null files)
+        (setf (vhdl-nav--run-dispatched run) t)
+      (let ((chunks (vhdl-nav--chunk-list
+                     files (min (vhdl-nav--effective-worker-count)
+                                (length files))))
+            (config (vhdl-nav--job-config root)))
+        (dolist (chunk chunks)
+          (vhdl-nav--spawn-worker run (append config (list :files chunk))
+                                  chunk "parse"))
+        (message "vhdl-navigator: indexing %d file(s) with %d worker process(es)..."
+                 (length files) (length chunks))
+        (setf (vhdl-nav--run-dispatched run) t)))))
+
+(defun vhdl-nav--worker-sentinel (proc _event)
+  "Clean up after worker PROC exits; finish or repair the run."
+  (unless (process-live-p proc)
+    (let ((run (process-get proc 'vhdl-nav-run))
+          (job-file (process-get proc 'vhdl-nav-job-file))
+          (remaining (process-get proc 'vhdl-nav-files))
+          (buf (process-get proc 'vhdl-nav-buf)))
+      (when job-file (ignore-errors (delete-file job-file)))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (when (and (vhdl-nav--run-p run) (eq run vhdl-nav--parallel-run))
+        (setf (vhdl-nav--run-procs run)
+              (delq proc (vhdl-nav--run-procs run)))
+        ;; Files the worker never reported: hand them to the in-process
+        ;; indexer so nothing is silently lost.
+        (when remaining
+          (message "vhdl-navigator: worker exited early, re-queueing %d file(s)"
+                   (length remaining))
+          (cl-decf (vhdl-nav--run-total run) (length remaining))
+          (vhdl-nav--build-index-idle-files (vhdl-nav--run-root run) remaining))
+        (unless (vhdl-nav--run-procs run)
+          (if (vhdl-nav--run-dispatched run)
+              (vhdl-nav--parallel-finish run)
+            ;; Discovery worker died without delivering a file list.
+            (setq vhdl-nav--parallel-run nil)
+            (message "vhdl-navigator: background scan failed, falling back to in-process indexing")
+            (let ((root (vhdl-nav--run-root run)))
+              (vhdl-nav--build-index-idle-files
+               root (or (vhdl-nav--run-files run)
+                        (vhdl-nav--find-vhdl-files root))))))))))
+
+(defun vhdl-nav--parallel-finish (run)
+  "Finalize RUN: persist the cache and start file watchers."
+  (when (eq run vhdl-nav--parallel-run)
+    (setq vhdl-nav--parallel-run nil))
+  (let ((root (vhdl-nav--run-root run)))
+    (message "vhdl-navigator: indexing complete - %d file(s) in %.1fs"
+             (vhdl-nav--run-done run)
+             (float-time (time-since (vhdl-nav--run-start-time run))))
+    (vhdl-nav--save-cache root)
+    (vhdl-nav--setup-watchers-from-index root)))
+
+(defun vhdl-nav--parallel-cancel ()
+  "Kill any live worker subprocesses and discard the current run."
+  (when vhdl-nav--parallel-run
+    (let ((run vhdl-nav--parallel-run))
+      ;; Clear first so sentinels see a stale run and do nothing.
+      (setq vhdl-nav--parallel-run nil)
+      (dolist (proc (vhdl-nav--run-procs run))
+        (let ((jf (process-get proc 'vhdl-nav-job-file))
+              (buf (process-get proc 'vhdl-nav-buf)))
+          (when jf (ignore-errors (delete-file jf)))
+          (when (buffer-live-p buf) (kill-buffer buf)))
+        (when (process-live-p proc)
+          (ignore-errors (delete-process proc)))))))
+
+(defun vhdl-nav--build-index-parallel (root &optional files priority-dir)
+  "Index ROOT using worker subprocesses.
+With FILES, parse exactly those; otherwise a discovery worker scans
+ROOT first so even the directory walk never blocks Emacs.  Files under
+PRIORITY-DIR are parsed first.  Returns non-nil when the run started,
+nil on spawn failure so callers can fall back to in-process indexing."
+  (condition-case err
+      (progn
+        (vhdl-nav--parallel-cancel)
+        (unless (gethash root vhdl-nav--project-indices)
+          (puthash root (make-hash-table :test 'equal)
+                   vhdl-nav--project-indices))
+        (unless (gethash root vhdl-nav--file-mtimes)
+          (puthash root (make-hash-table :test 'equal)
+                   vhdl-nav--file-mtimes))
+        (let ((run (vhdl-nav--run-create
+                    :root root :total 0 :done 0
+                    :start-time (current-time) :last-progress 0.0
+                    :priority-dir priority-dir)))
+          (setq vhdl-nav--parallel-run run)
+          (if files
+              (vhdl-nav--parallel-dispatch run files)
+            (message "vhdl-navigator: scanning %s in the background..."
+                     (abbreviate-file-name root))
+            (vhdl-nav--spawn-worker
+             run (append (vhdl-nav--job-config root) (list :discover t))
+             nil "discover"))
+          t))
+    (error
+     (message "vhdl-navigator: cannot start worker processes: %s" err)
+     (vhdl-nav--parallel-cancel)
+     nil)))
 
 (defun vhdl-nav--build-index-sync (root)
   "Build a fresh index for project at ROOT synchronously."
@@ -834,20 +1214,48 @@ Returns the number of defs added."
              count (length (or files '())))
     index))
 
-(defun vhdl-nav--async-cancel ()
-  "Cancel any in-progress async indexing."
+(defun vhdl-nav--idle-cancel ()
+  "Cancel the in-process idle-timer indexing run, if any."
   (when vhdl-nav--async-timer
     (cancel-timer vhdl-nav--async-timer)
     (setq vhdl-nav--async-timer nil
           vhdl-nav--async-queue nil)))
 
+(defun vhdl-nav--async-cancel ()
+  "Cancel all in-progress indexing, idle-timer and subprocess based."
+  (vhdl-nav--parallel-cancel)
+  (vhdl-nav--idle-cancel))
+
 (defun vhdl-nav--build-index-async (root)
-  "Start full async indexing for project at ROOT."
-  (let ((files (vhdl-nav--find-vhdl-files root)))
-    (vhdl-nav--build-index-async-files root files)))
+  "Start full async indexing for project at ROOT.
+File discovery itself is offloaded to a subprocess when possible,
+because scanning a large tree can block Emacs for seconds."
+  (unless (and (vhdl-nav--parallel-available-p root)
+               (vhdl-nav--build-index-parallel root nil (vhdl-nav--priority-dir)))
+    (vhdl-nav--build-index-async-files
+     root
+     (vhdl-nav--order-files (vhdl-nav--find-vhdl-files root)
+                            (vhdl-nav--priority-dir)))))
 
 (defun vhdl-nav--build-index-async-files (root files)
-  "Start async indexing of FILES for project at ROOT.
+  "Index FILES for project at ROOT without blocking Emacs.
+Routes large batches to parallel worker subprocesses when available;
+small batches (and systems without workers) use the in-process
+idle-timer indexer."
+  (when files
+    (unless (and (>= (length files) vhdl-nav-worker-min-files)
+                 ;; Never stack a second parallel run onto the same root;
+                 ;; extra files just take the in-process path meanwhile.
+                 (not (and vhdl-nav--parallel-run
+                           (equal (vhdl-nav--run-root vhdl-nav--parallel-run)
+                                  root)))
+                 (vhdl-nav--parallel-available-p root)
+                 (vhdl-nav--build-index-parallel root files
+                                                 (vhdl-nav--priority-dir)))
+      (vhdl-nav--build-index-idle-files root files))))
+
+(defun vhdl-nav--build-index-idle-files (root files)
+  "In-process fallback: index FILES for ROOT in idle-timer batches.
 Parses `vhdl-nav-index-batch-size' files per idle cycle.
 Stale files are purged from the index before re-parsing.
 If an async run for ROOT is already in progress, the new files are merged
@@ -855,14 +1263,14 @@ into the existing queue rather than cancelling the ongoing work."
   (if (or (null files) (<= vhdl-nav-index-batch-size 0))
       ;; No files or sync mode: fall back to sync for just these files
       (when files
-        (vhdl-nav--async-cancel)
+        (vhdl-nav--idle-cancel)
         (let ((index (or (gethash root vhdl-nav--project-indices)
                          (make-hash-table :test 'equal)))
               (mtimes (or (gethash root vhdl-nav--file-mtimes)
                           (make-hash-table :test 'equal)))
               (count 0))
           (dolist (f files)
-            (vhdl-nav--purge-file-from-index index f)
+            (vhdl-nav--purge-if-indexed index mtimes f)
             (setq count (+ count (vhdl-nav--index-file-into index mtimes f))))
           (puthash root index vhdl-nav--project-indices)
           (puthash root mtimes vhdl-nav--file-mtimes)
@@ -886,7 +1294,7 @@ into the existing queue rather than cancelling the ongoing work."
             (setq vhdl-nav--async-timer
                   (run-with-idle-timer 0.5 nil #'vhdl-nav--async-index-batch))))
       ;; Different project or idle queue - start fresh
-      (vhdl-nav--async-cancel)
+      (vhdl-nav--idle-cancel)
       (unless (gethash root vhdl-nav--file-mtimes)
         (puthash root (make-hash-table :test 'equal) vhdl-nav--file-mtimes))
       (setq vhdl-nav--async-root root
@@ -932,7 +1340,7 @@ Otherwise processes one batch and schedules the next."
         (while (and vhdl-nav--async-queue (< processed batch-size))
           (let ((f (pop vhdl-nav--async-queue)))
             ;; Purge old defs for this file before re-parsing
-            (vhdl-nav--purge-file-from-index index f)
+            (vhdl-nav--purge-if-indexed index mtimes f)
             (setq vhdl-nav--async-count
                   (+ vhdl-nav--async-count
                      (vhdl-nav--index-file-into index mtimes f))))
@@ -1169,7 +1577,9 @@ Otherwise processes one batch and schedules the next."
   "Force a full re-index of the current project."
   (interactive)
   (vhdl-nav--get-index t)
-  (message "vhdl-navigator: reindex complete"))
+  (if vhdl-nav--parallel-run
+      (message "vhdl-navigator: re-indexing in the background...")
+    (message "vhdl-navigator: reindex complete")))
 
 (defun vhdl-nav-show-record (name)
   "Display the fields of record NAME in a help buffer."
