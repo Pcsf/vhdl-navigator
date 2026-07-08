@@ -911,9 +911,20 @@ Returns the number of defs added."
         (t vhdl-nav-worker-count)))
 
 (defun vhdl-nav--emacs-binary ()
-  "Path of the Emacs executable to use for worker subprocesses."
-  (let ((exe (expand-file-name invocation-name invocation-directory)))
-    (if (file-executable-p exe) exe (executable-find "emacs"))))
+  "Path of the Emacs executable to use for worker subprocesses.
+Prefers the running binary.  On Windows `invocation-name' may lack the
+.exe suffix, or be runemacs.exe (the GUI launcher, which cannot run
+batch jobs over pipes), so emacs.exe next to the running binary is
+tried as well; PATH is only a last resort."
+  (seq-find #'file-executable-p
+            (delq nil
+                  (list
+                   (unless (string-prefix-p "runemacs"
+                                            (downcase invocation-name))
+                     (expand-file-name invocation-name invocation-directory))
+                   (expand-file-name "emacs.exe" invocation-directory)
+                   (expand-file-name "emacs" invocation-directory)
+                   (executable-find "emacs")))))
 
 (defun vhdl-nav--library ()
   "Path of this library, for workers to load."
@@ -926,6 +937,15 @@ Returns the number of defs added."
        (not (file-remote-p root))
        (vhdl-nav--library)
        (vhdl-nav--emacs-binary)))
+
+(defvar vhdl-nav--worker-hint-shown nil
+  "Non-nil once the worker-unavailable hint has been shown this session.")
+
+(defun vhdl-nav--worker-unavailable-hint ()
+  "Tell the user (once) that indexing fell back to the slow path."
+  (unless vhdl-nav--worker-hint-shown
+    (setq vhdl-nav--worker-hint-shown t)
+    (message "vhdl-navigator: worker subprocesses unavailable - using slower in-process indexing (M-x vhdl-nav-worker-status to see why)")))
 
 (defun vhdl-nav--current-vhdl-file ()
   "Return function `buffer-file-name' when visiting a VHDL file, else nil."
@@ -1252,6 +1272,9 @@ idle-timer indexer."
                  (vhdl-nav--parallel-available-p root)
                  (vhdl-nav--build-index-parallel root files
                                                  (vhdl-nav--priority-dir)))
+      (when (and (>= (length files) vhdl-nav-worker-min-files)
+                 (not (vhdl-nav--parallel-available-p root)))
+        (vhdl-nav--worker-unavailable-hint))
       (vhdl-nav--build-index-idle-files root files))))
 
 (defun vhdl-nav--build-index-idle-files (root files)
@@ -1660,6 +1683,28 @@ Otherwise processes one batch and schedules the next."
           (forward-line (1- (vhdl-nav-def-line d))))
       (message "Field '%s' not found in record '%s'" field-name rec-name))))
 
+(defun vhdl-nav-worker-status ()
+  "Report whether parallel worker indexing is available, and why not."
+  (interactive)
+  (let* ((root (vhdl-nav--project-root))
+         (count (vhdl-nav--effective-worker-count))
+         (bin (vhdl-nav--emacs-binary))
+         (lib (vhdl-nav--library))
+         (remote (and (stringp root) (file-remote-p root))))
+    (message
+     (concat "vhdl-navigator workers: %s\n"
+             "  worker count : %d%s\n"
+             "  emacs binary : %s\n"
+             "  library      : %s\n"
+             "  project root : %s%s")
+     (if (vhdl-nav--parallel-available-p root) "AVAILABLE" "NOT AVAILABLE")
+     count
+     (if (zerop count) "  (disabled by vhdl-nav-worker-count)" "")
+     (or bin "NOT FOUND - no emacs executable next to the running one or in PATH")
+     (or lib "NOT FOUND - vhdl-navigator.el location unknown")
+     root
+     (if remote "  (remote - workers disabled)" ""))))
+
 ;; ---------------------------------------------------------------------------
 ;; Diagnostic command
 ;; ---------------------------------------------------------------------------
@@ -1723,6 +1768,7 @@ we can resolve, and only outside comments and string literals."
             (define-key map (kbd "C-c v j") #'vhdl-nav-jump-to-record-field)
             (define-key map (kbd "C-c v i") #'vhdl-nav-reindex)
             (define-key map (kbd "C-c v d") #'vhdl-nav-diagnose)
+            (define-key map (kbd "C-c v w") #'vhdl-nav-worker-status)
             map)
   (if vhdl-navigator-mode
       (progn
